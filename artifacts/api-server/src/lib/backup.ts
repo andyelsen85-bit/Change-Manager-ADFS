@@ -39,6 +39,7 @@ const TABLES = [
   "smtp_settings",
   "ldap_settings",
   "ssl_settings",
+  "adfs_settings",
   "notification_settings",
   "sdp_settings",
   "notification_queue",
@@ -49,6 +50,7 @@ const TABLES = [
 // Tables that are new in the current backup version. Older backups (v1)
 // don't include these — that's fine, we leave them empty after restore.
 const TABLES_OPTIONAL = new Set<string>([
+  "adfs_settings",
   "sdp_settings",
   "change_categories",
   "change_assignees",

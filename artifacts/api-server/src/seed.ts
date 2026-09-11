@@ -7,6 +7,7 @@ import {
   standardTemplatesTable,
   smtpSettingsTable,
   ldapSettingsTable,
+  adfsSettingsTable,
   sslSettingsTable,
   changeCategoriesTable,
   pentestTestTypesTable,
@@ -303,6 +304,7 @@ export async function runSeed(): Promise<void> {
   // Settings rows (single-row keyed by 'global')
   await db.insert(smtpSettingsTable).values({ key: "global" }).onConflictDoNothing();
   await db.insert(ldapSettingsTable).values({ key: "global" }).onConflictDoNothing();
+  await db.insert(adfsSettingsTable).values({ key: "global" }).onConflictDoNothing();
   await db.insert(sslSettingsTable).values({ key: "global" }).onConflictDoNothing();
 
   // Default notification routing rules — idempotent: only inserted when the

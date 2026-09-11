@@ -5,6 +5,8 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { fmtDate, fmtDateTime } from "@/lib/format";
 import type { CategoryItem, LdapSettings, LdapTestResult, PentestTestType, SdpSettings, SmtpSettings, SslSettings } from "@/lib/types";
+import { useGetAdfsSettings, useUpdateAdfsSettings, useTestAdfsSettings, getGetAdfsSettingsQueryKey } from "@workspace/api-client-react";
+import type { AdfsSettings, AdfsTestResult } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -58,6 +60,7 @@ export function SettingsPage() {
         <TabsList>
           <TabsTrigger value="smtp" data-testid="tab-smtp">SMTP</TabsTrigger>
           <TabsTrigger value="ldap" data-testid="tab-ldap">LDAP</TabsTrigger>
+          <TabsTrigger value="adfs" data-testid="tab-adfs">ADFS</TabsTrigger>
           <TabsTrigger value="ssl" data-testid="tab-ssl">SSL/TLS</TabsTrigger>
           <TabsTrigger value="notifications" data-testid="tab-notifications">Notifications</TabsTrigger>
           <TabsTrigger value="categories" data-testid="tab-categories">Categories</TabsTrigger>
@@ -67,6 +70,7 @@ export function SettingsPage() {
         </TabsList>
         <TabsContent value="smtp"><SmtpPanel /></TabsContent>
         <TabsContent value="ldap"><LdapPanel /></TabsContent>
+        <TabsContent value="adfs"><AdfsPanel /></TabsContent>
         <TabsContent value="ssl"><SslPanel /></TabsContent>
         <TabsContent value="notifications"><NotificationsBatchPanel /></TabsContent>
         <TabsContent value="categories"><CategoriesPanel /></TabsContent>
@@ -1950,6 +1954,149 @@ function PentestTypesPanel() {
           )}
         </DialogContent>
       </Dialog>
+    </Card>
+  );
+}
+function AdfsPanel() {
+  const qc = useQueryClient();
+  const { data: adfsData } = useGetAdfsSettings();
+  const [form, setForm] = useState<(AdfsSettings & { clientSecret: string }) | null>(null);
+
+  useEffect(() => {
+    if (adfsData && !form) {
+      setForm({
+        ...adfsData,
+        redirectUri:
+          adfsData.redirectUri ||
+          `${window.location.origin}/api/auth/adfs/callback`,
+        clientSecret: "",
+      });
+    }
+  }, [adfsData, form]);
+
+  const save = useUpdateAdfsSettings({
+    mutation: {
+      onSuccess: (row) => {
+        toast.success("ADFS settings saved");
+        setForm({ ...row, clientSecret: "" });
+        qc.invalidateQueries({ queryKey: getGetAdfsSettingsQueryKey() });
+      },
+      onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+    }
+  });
+
+  const [lastResult, setLastResult] = useState<AdfsTestResult | null>(null);
+  const test = useTestAdfsSettings({
+    mutation: {
+      onSuccess: (r) => {
+        setLastResult(r);
+        if (r.success) toast.success(r.message);
+        else toast.error(r.message);
+      },
+      onError: (err) => {
+        const msg = err instanceof Error ? err.message : "Test failed";
+        setLastResult({ success: false, message: msg });
+        toast.error(msg);
+      }
+    }
+  });
+
+  if (!form) return <Skeleton className="mt-4 h-72 w-full" />;
+
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="text-base">Microsoft AD FS (OpenID Connect)</CardTitle>
+        <CardDescription>Configure single sign-on using Active Directory Federation Services.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex items-center justify-between rounded-md border border-border p-3">
+          <Label>Enabled</Label>
+          <Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} data-testid="switch-adfs-enabled" />
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-2 md:col-span-2">
+            <Label>Issuer URL</Label>
+            <Input value={form.issuer} onChange={(e) => setForm({ ...form, issuer: e.target.value })} placeholder="https://adfs.example.com/adfs" data-testid="input-adfs-issuer" />
+            <p className="text-xs text-muted-foreground">
+              The base URL of your AD FS server. This is used to discover the OpenID Connect metadata.
+            </p>
+          </div>
+          <div className="space-y-2 md:col-span-2">
+            <Label>Redirect URI</Label>
+            <div className="flex gap-2">
+              <Input readOnly value={form.redirectUri} className="font-mono text-xs bg-muted/50" data-testid="input-adfs-redirect-uri" />
+              <Button variant="outline" size="icon" onClick={() => { navigator.clipboard.writeText(form.redirectUri); toast.success("Copied"); }}><Copy className="h-4 w-4" /></Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              This exact URI must be registered in the AD FS Application Group as an allowed Redirect URI.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label>Client ID</Label>
+            <Input value={form.clientId} onChange={(e) => setForm({ ...form, clientId: e.target.value })} data-testid="input-adfs-client-id" />
+            <p className="text-xs text-muted-foreground">
+              The Client Identifier generated by AD FS.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label>{form.clientSecretSet ? "Client Secret (leave blank to keep)" : "Client Secret"}</Label>
+            <Input type="password" value={form.clientSecret} onChange={(e) => setForm({ ...form, clientSecret: e.target.value })} data-testid="input-adfs-client-secret" />
+            <p className="text-xs text-muted-foreground">
+              The secret generated by AD FS for this application.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label>Scopes</Label>
+            <Input value={form.scope} onChange={(e) => setForm({ ...form, scope: e.target.value })} data-testid="input-adfs-scope" />
+            <p className="text-xs text-muted-foreground">
+              Typically includes <code>openid profile email</code>.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label>Username Claim</Label>
+            <Input value={form.usernameClaim} onChange={(e) => setForm({ ...form, usernameClaim: e.target.value })} data-testid="input-adfs-username-claim" />
+            <p className="text-xs text-muted-foreground">
+              The claim to map to the user's username (e.g., <code>upn</code> or <code>preferred_username</code>).
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center justify-between rounded-md border border-border p-3">
+          <div>
+            <Label>Auto-provision users</Label>
+            <p className="text-xs text-muted-foreground">
+              Automatically create non-admin application accounts for new AD FS users on their first login.
+            </p>
+          </div>
+          <Switch checked={form.autoProvision} onCheckedChange={(v) => setForm({ ...form, autoProvision: v })} data-testid="switch-adfs-autoprovision" />
+        </div>
+
+        {lastResult && (
+          <Alert variant={lastResult.success ? "default" : "destructive"}>
+            {lastResult.success ? <CheckCircle2 className="h-4 w-4 text-success" /> : <AlertTriangle className="h-4 w-4" />}
+            <AlertDescription>
+              {lastResult.message}
+              {lastResult.success && lastResult.authorizationEndpoint && (
+                <div className="mt-2 text-xs opacity-80 font-mono">
+                  <div>Auth: {lastResult.authorizationEndpoint}</div>
+                  <div>Token: {lastResult.tokenEndpoint}</div>
+                </div>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <div className="flex justify-end gap-2 border-t border-border pt-4">
+          <Button variant="outline" onClick={() => test.mutate()} disabled={test.isPending} data-testid="button-adfs-test">
+            {test.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <CheckCircle2 className="mr-2 h-4 w-4" />}
+            Test Discovery
+          </Button>
+          <Button onClick={() => save.mutate({ data: form })} disabled={save.isPending} data-testid="button-adfs-save">
+            {save.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+            Save
+          </Button>
+        </div>
+      </CardContent>
     </Card>
   );
 }

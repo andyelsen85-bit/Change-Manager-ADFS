@@ -2,7 +2,10 @@ import { createHash, createPublicKey, randomBytes } from "node:crypto";
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import type { Request, Response } from "express";
 import { fetch } from "undici";
+import { eq } from "drizzle-orm";
+import { adfsSettingsTable, db } from "@workspace/db";
 import { signAuthState, verifyAuthState } from "./auth";
+import { decryptSecret } from "./secret-crypto";
 
 const NODE_ENV = process.env["NODE_ENV"] ?? "development";
 const STATE_COOKIE = "cm_adfs_state";
@@ -28,25 +31,78 @@ export type AdfsClaims = {
   fullName: string;
 };
 
-let discoveryCache: { expiresAt: number; value: DiscoveryDocument } | null = null;
+export type AdfsRuntimeConfig = {
+  enabled: boolean;
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scope: string;
+  usernameClaim: string;
+  autoProvision: boolean;
+};
+
+let discoveryCache: { issuer: string; expiresAt: number; value: DiscoveryDocument } | null = null;
 
 function env(name: string): string {
   return (process.env[name] ?? "").trim();
 }
 
-function issuer(): string {
-  return env("ADFS_OIDC_ISSUER").replace(/\/+$/, "");
+function envConfiguration(): AdfsRuntimeConfig {
+  return {
+    enabled: true,
+    issuer: env("ADFS_OIDC_ISSUER").replace(/\/+$/, ""),
+    clientId: env("ADFS_CLIENT_ID"),
+    clientSecret: env("ADFS_CLIENT_SECRET"),
+    redirectUri: env("ADFS_REDIRECT_URI"),
+    scope: env("ADFS_SCOPE") || "openid profile email",
+    usernameClaim: env("ADFS_USERNAME_CLAIM") || "upn",
+    autoProvision: env("ADFS_AUTO_PROVISION") === "true",
+  };
 }
 
-export function isAdfsConfigured(): boolean {
-  return Boolean(issuer() && env("ADFS_CLIENT_ID") && env("ADFS_CLIENT_SECRET") && env("ADFS_REDIRECT_URI"));
+export async function getAdfsConfiguration(): Promise<AdfsRuntimeConfig> {
+  const [row] = await db
+    .select()
+    .from(adfsSettingsTable)
+    .where(eq(adfsSettingsTable.key, "global"));
+  const hasStoredConfiguration = Boolean(
+    row && (row.issuer || row.clientId || row.clientSecretEnc || row.redirectUri),
+  );
+  if (!hasStoredConfiguration) return envConfiguration();
+  return {
+    enabled: row.enabled,
+    issuer: row.issuer.replace(/\/+$/, ""),
+    clientId: row.clientId,
+    clientSecret: decryptSecret(row.clientSecretEnc),
+    redirectUri: row.redirectUri,
+    scope: row.scope || "openid profile email",
+    usernameClaim: row.usernameClaim || "upn",
+    autoProvision: row.autoProvision,
+  };
 }
 
-function requireConfiguration(): void {
-  if (!isAdfsConfigured()) {
+export async function isAdfsConfigured(): Promise<boolean> {
+  const config = await getAdfsConfiguration();
+  return Boolean(
+    config.enabled &&
+      config.issuer &&
+      config.clientId &&
+      config.clientSecret &&
+      config.redirectUri,
+  );
+}
+
+function requireConfiguration(config: AdfsRuntimeConfig): void {
+  if (
+    !config.enabled ||
+    !config.issuer ||
+    !config.clientId ||
+    !config.clientSecret ||
+    !config.redirectUri
+  ) {
     throw new Error(
-      "ADFS SSO is not configured. Set ADFS_OIDC_ISSUER, ADFS_CLIENT_ID, " +
-        "ADFS_CLIENT_SECRET, and ADFS_REDIRECT_URI.",
+      "ADFS SSO is disabled or incomplete. Configure it in Settings → ADFS.",
     );
   }
 }
@@ -62,17 +118,28 @@ function cookieOptions(req: Request) {
   };
 }
 
-function getDiscovery(): Promise<DiscoveryDocument> {
-  requireConfiguration();
-  if (discoveryCache && discoveryCache.expiresAt > Date.now()) return Promise.resolve(discoveryCache.value);
-  return fetch(`${issuer()}/.well-known/openid-configuration`)
+function getDiscovery(config: AdfsRuntimeConfig, allowDisabled = false): Promise<DiscoveryDocument> {
+  if (!allowDisabled) requireConfiguration(config);
+  if (!config.issuer) throw new Error("ADFS issuer is required");
+  if (
+    discoveryCache &&
+    discoveryCache.issuer === config.issuer &&
+    discoveryCache.expiresAt > Date.now()
+  ) {
+    return Promise.resolve(discoveryCache.value);
+  }
+  return fetch(`${config.issuer}/.well-known/openid-configuration`)
     .then(async (response) => {
       if (!response.ok) throw new Error(`ADFS discovery returned HTTP ${response.status}`);
       const value = (await response.json()) as DiscoveryDocument;
       if (!value.authorization_endpoint || !value.token_endpoint || !value.jwks_uri) {
         throw new Error("ADFS discovery document is missing an OAuth endpoint");
       }
-      discoveryCache = { expiresAt: Date.now() + 5 * 60 * 1000, value };
+      discoveryCache = {
+        issuer: config.issuer,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+        value,
+      };
       return value;
     });
 }
@@ -97,11 +164,10 @@ function claimNames(name: string): string[] {
   ];
 }
 
-export function extractAdfsClaims(payload: JwtPayload): AdfsClaims {
+export function extractAdfsClaims(payload: JwtPayload, usernameClaim = "upn"): AdfsClaims {
   const claims = payload as Record<string, unknown>;
-  const configuredUsernameClaim = env("ADFS_USERNAME_CLAIM") || "upn";
   const username =
-    readClaim(claims, configuredUsernameClaim, ...claimNames(configuredUsernameClaim)) ??
+    readClaim(claims, usernameClaim, ...claimNames(usernameClaim)) ??
     readClaim(claims, ...claimNames("preferred_username"), ...claimNames("email")) ??
     payload.sub ??
     "";
@@ -114,7 +180,8 @@ export function extractAdfsClaims(payload: JwtPayload): AdfsClaims {
 }
 
 export async function beginAdfsLogin(req: Request, res: Response): Promise<void> {
-  const discovery = await getDiscovery();
+  const config = await getAdfsConfiguration();
+  const discovery = await getDiscovery(config);
   const state = base64Url(randomBytes(32));
   const nonce = base64Url(randomBytes(32));
   const codeVerifier = base64Url(randomBytes(32));
@@ -124,11 +191,11 @@ export async function beginAdfsLogin(req: Request, res: Response): Promise<void>
 
   const url = new URL(discovery.authorization_endpoint);
   url.search = new URLSearchParams({
-    client_id: env("ADFS_CLIENT_ID"),
+    client_id: config.clientId,
     response_type: "code",
-    redirect_uri: env("ADFS_REDIRECT_URI"),
+    redirect_uri: config.redirectUri,
     response_mode: "query",
-    scope: env("ADFS_SCOPE") || "openid profile email",
+    scope: config.scope,
     state,
     nonce,
     code_challenge: codeChallenge,
@@ -146,13 +213,18 @@ function readState(req: Request): AdfsState {
   return state;
 }
 
-async function exchangeCode(code: string, state: AdfsState, discovery: DiscoveryDocument) {
+async function exchangeCode(
+  code: string,
+  state: AdfsState,
+  discovery: DiscoveryDocument,
+  config: AdfsRuntimeConfig,
+) {
   const body = new URLSearchParams({
     grant_type: "authorization_code",
-    client_id: env("ADFS_CLIENT_ID"),
-    client_secret: env("ADFS_CLIENT_SECRET"),
+    client_id: config.clientId,
+    client_secret: config.clientSecret,
     code,
-    redirect_uri: env("ADFS_REDIRECT_URI"),
+    redirect_uri: config.redirectUri,
     code_verifier: state.codeVerifier,
   });
   const response = await fetch(discovery.token_endpoint, {
@@ -167,7 +239,12 @@ async function exchangeCode(code: string, state: AdfsState, discovery: Discovery
   return payload.id_token;
 }
 
-async function validateIdToken(idToken: string, state: AdfsState, discovery: DiscoveryDocument): Promise<AdfsClaims> {
+async function validateIdToken(
+  idToken: string,
+  state: AdfsState,
+  discovery: DiscoveryDocument,
+  config: AdfsRuntimeConfig,
+): Promise<AdfsClaims> {
   const decoded = jwt.decode(idToken, { complete: true });
   if (!decoded || typeof decoded === "string" || !decoded.header.kid) throw new Error("Invalid ADFS ID token");
   const jwksResponse = await fetch(discovery.jwks_uri, { headers: { accept: "application/json" } });
@@ -181,18 +258,47 @@ async function validateIdToken(idToken: string, state: AdfsState, discovery: Dis
   const publicKey = createPublicKey({ key: jwk as any, format: "jwk" });
   const payload = jwt.verify(idToken, publicKey, {
     algorithms: ["RS256"],
-    issuer: discovery.issuer || issuer(),
-    audience: env("ADFS_CLIENT_ID"),
+    issuer: discovery.issuer || config.issuer,
+    audience: config.clientId,
   }) as JwtPayload;
   if (payload.nonce !== state.nonce) throw new Error("ADFS nonce mismatch");
-  return extractAdfsClaims(payload);
+  return extractAdfsClaims(payload, config.usernameClaim);
 }
 
 export async function finishAdfsLogin(req: Request, res: Response): Promise<AdfsClaims> {
   const state = readState(req);
   res.clearCookie(STATE_COOKIE, { path: "/api/auth/adfs" });
   if (typeof req.query.code !== "string" || !req.query.code) throw new Error("ADFS did not return an authorization code");
-  const discovery = await getDiscovery();
-  const idToken = await exchangeCode(req.query.code, state, discovery);
-  return validateIdToken(idToken, state, discovery);
+  const config = await getAdfsConfiguration();
+  const discovery = await getDiscovery(config);
+  const idToken = await exchangeCode(req.query.code, state, discovery, config);
+  return validateIdToken(idToken, state, discovery, config);
+}
+
+export async function testAdfsConfiguration(): Promise<{
+  success: boolean;
+  message: string;
+  issuer?: string;
+  authorizationEndpoint?: string;
+  tokenEndpoint?: string;
+}> {
+  const config = await getAdfsConfiguration();
+  if (!config.issuer) {
+    return { success: false, message: "Save an ADFS issuer before testing." };
+  }
+  try {
+    const discovery = await getDiscovery(config, true);
+    return {
+      success: true,
+      message: "ADFS discovery document loaded successfully.",
+      issuer: discovery.issuer,
+      authorizationEndpoint: discovery.authorization_endpoint,
+      tokenEndpoint: discovery.token_endpoint,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : "ADFS discovery test failed.",
+    };
+  }
 }

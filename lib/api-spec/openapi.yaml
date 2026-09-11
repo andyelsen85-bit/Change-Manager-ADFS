@@ -738,6 +738,32 @@ paths:
         "200":
           description: Diagnostic result of the bind attempt — includes which stage failed and the underlying LDAP error code so admins can fix configuration without reading server logs.
           content: { application/json: { schema: { $ref: "#/components/schemas/LdapTestResult" } } }
+  /settings/adfs:
+    get:
+      operationId: getAdfsSettings
+      tags: [settings]
+      responses:
+        "200":
+          description: Masked ADFS OpenID Connect configuration
+          content: { application/json: { schema: { $ref: "#/components/schemas/AdfsSettings" } } }
+    put:
+      operationId: updateAdfsSettings
+      tags: [settings]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AdfsSettingsUpdate" } } }
+      responses:
+        "200":
+          description: Updated masked ADFS configuration
+          content: { application/json: { schema: { $ref: "#/components/schemas/AdfsSettings" } } }
+  /settings/adfs/test:
+    post:
+      operationId: testAdfsSettings
+      tags: [settings]
+      responses:
+        "200":
+          description: ADFS discovery endpoint validation result
+          content: { application/json: { schema: { $ref: "#/components/schemas/AdfsTestResult" } } }
   /settings/ssl:
     get:
       operationId: getSslSettings
@@ -1411,6 +1437,44 @@ components:
         code:    { type: string, description: "LDAP result-code name (e.g. InvalidCredentialsError) or socket error code (e.g. ECONNREFUSED). Optional." }
         details: { type: string, description: "Server-side diagnostic message from the directory, when one was returned. Optional." }
         userDn:  { type: string, description: "The full DN that was resolved and bound. Populated only on success." }
+
+    AdfsSettings:
+      type: object
+      required: [enabled, issuer, clientId, clientSecretSet, redirectUri, scope, usernameClaim, autoProvision]
+      properties:
+        enabled: { type: boolean }
+        issuer: { type: string }
+        clientId: { type: string }
+        clientSecretSet: { type: boolean }
+        redirectUri: { type: string }
+        scope: { type: string }
+        usernameClaim: { type: string }
+        autoProvision: { type: boolean }
+
+    AdfsSettingsUpdate:
+      type: object
+      required: [enabled, issuer, clientId, redirectUri, scope, usernameClaim, autoProvision]
+      properties:
+        enabled: { type: boolean }
+        issuer: { type: string }
+        clientId: { type: string }
+        clientSecret:
+          type: ["string", "null"]
+          description: "A non-empty value replaces the encrypted secret; null or an empty value keeps the existing secret."
+        redirectUri: { type: string }
+        scope: { type: string }
+        usernameClaim: { type: string }
+        autoProvision: { type: boolean }
+
+    AdfsTestResult:
+      type: object
+      required: [success, message]
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        issuer: { type: string }
+        authorizationEndpoint: { type: string }
+        tokenEndpoint: { type: string }
 
     SslSettings:
       type: object

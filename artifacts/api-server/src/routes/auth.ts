@@ -17,7 +17,12 @@ import {
 import { audit } from "../lib/audit";
 import { authenticateLdap, getLdap } from "../lib/ldap";
 import { userCanAccessPentest } from "./pentest";
-import { beginAdfsLogin, finishAdfsLogin, isAdfsConfigured } from "../lib/adfs";
+import {
+  beginAdfsLogin,
+  finishAdfsLogin,
+  getAdfsConfiguration,
+  isAdfsConfigured,
+} from "../lib/adfs";
 
 const router: IRouter = Router();
 
@@ -33,6 +38,7 @@ router.get("/auth/adfs/start", async (req, res): Promise<void> => {
 router.get("/auth/adfs/callback", async (req, res): Promise<void> => {
   try {
     const claims = await finishAdfsLogin(req, res);
+    const adfsConfig = await getAdfsConfiguration();
     const candidates = Array.from(
       new Set([claims.username, claims.email ?? "", claims.username.split("@")[0]].filter(Boolean)),
     );
@@ -54,7 +60,7 @@ router.get("/auth/adfs/callback", async (req, res): Promise<void> => {
     }
 
     if (!existing) {
-      if (process.env["ADFS_AUTO_PROVISION"] !== "true" || !claims.email) {
+      if (!adfsConfig.autoProvision || !claims.email) {
         res.redirect("/login?adfs=not-provisioned");
         return;
       }
@@ -99,8 +105,8 @@ router.get("/auth/adfs/callback", async (req, res): Promise<void> => {
   }
 });
 
-router.get("/auth/adfs/config", (_req, res): void => {
-  res.json({ enabled: isAdfsConfigured() });
+router.get("/auth/adfs/config", async (_req, res): Promise<void> => {
+  res.json({ enabled: await isAdfsConfigured() });
 });
 
 router.post("/auth/login", async (req, res): Promise<void> => {

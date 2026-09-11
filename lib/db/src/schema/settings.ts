@@ -45,6 +45,20 @@ export const ldapSettingsTable = pgTable("ldap_settings", {
   issuerCertPem: text("issuer_cert_pem"),
 });
 
+// Microsoft AD FS OpenID Connect configuration. The client secret is encrypted
+// at rest and never returned to the browser.
+export const adfsSettingsTable = pgTable("adfs_settings", {
+  key: text("key").primaryKey().default("global"),
+  enabled: boolean("enabled").notNull().default(false),
+  issuer: text("issuer").notNull().default(""),
+  clientId: text("client_id").notNull().default(""),
+  clientSecretEnc: text("client_secret_enc"),
+  redirectUri: text("redirect_uri").notNull().default(""),
+  scope: text("scope").notNull().default("openid profile email"),
+  usernameClaim: text("username_claim").notNull().default("upn"),
+  autoProvision: boolean("auto_provision").notNull().default(false),
+});
+
 export const sslSettingsTable = pgTable("ssl_settings", {
   key: text("key").primaryKey().default("global"),
   certificatePem: text("certificate_pem"),

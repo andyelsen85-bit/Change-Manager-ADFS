@@ -3,7 +3,7 @@ export type SessionUser = {
   username: string;
   email: string;
   fullName: string;
-  source: "local" | "ldap";
+  source: "local" | "ldap" | "adfs";
   isAdmin: boolean;
   roles: string[];
   mustChangePassword: boolean;
@@ -32,7 +32,7 @@ export type User = {
   username: string;
   email: string;
   fullName: string;
-  source: "local" | "ldap";
+  source: "local" | "ldap" | "adfs";
   isAdmin: boolean;
   isActive: boolean;
   notificationsEnabled: boolean;

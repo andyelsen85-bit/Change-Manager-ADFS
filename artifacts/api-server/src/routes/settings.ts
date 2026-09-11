@@ -5,6 +5,7 @@ import {
   db,
   smtpSettingsTable,
   ldapSettingsTable,
+  adfsSettingsTable,
   sslSettingsTable,
   sdpSettingsTable,
   notificationQueueTable,
@@ -14,8 +15,15 @@ import { requireAdmin } from "../lib/auth";
 import { audit } from "../lib/audit";
 import { sendTestEmail } from "../lib/email";
 import { testLdapConnection } from "../lib/ldap";
+import { testAdfsConfiguration } from "../lib/adfs";
 import { generateCsr } from "../lib/csr";
 import { encryptSecret } from "../lib/secret-crypto";
+import {
+  GetAdfsSettingsResponse,
+  TestAdfsSettingsResponse,
+  UpdateAdfsSettingsBody,
+  UpdateAdfsSettingsResponse,
+} from "@workspace/api-zod";
 import {
   flushNotificationQueue,
   getNotificationSettings,
@@ -232,6 +240,113 @@ router.post("/settings/ldap/test", requireAdmin, async (req, res): Promise<void>
     },
   });
   res.json(r);
+});
+
+function maskAdfs(row: typeof adfsSettingsTable.$inferSelect | undefined) {
+  return {
+    enabled: row?.enabled ?? false,
+    issuer: row?.issuer ?? "",
+    clientId: row?.clientId ?? "",
+    clientSecretSet: !!row?.clientSecretEnc,
+    redirectUri: row?.redirectUri ?? "",
+    scope: row?.scope || "openid profile email",
+    usernameClaim: row?.usernameClaim || "upn",
+    autoProvision: row?.autoProvision ?? false,
+  };
+}
+
+router.get("/settings/adfs", requireAdmin, async (_req, res): Promise<void> => {
+  const [row] = await db
+    .select()
+    .from(adfsSettingsTable)
+    .where(eq(adfsSettingsTable.key, KEY));
+  res.json(GetAdfsSettingsResponse.parse(maskAdfs(row)));
+});
+
+router.put("/settings/adfs", requireAdmin, async (req, res): Promise<void> => {
+  const parsed = UpdateAdfsSettingsBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+  const input = parsed.data;
+  const issuer = input.issuer.trim().replace(/\/+$/, "");
+  const redirectUri = input.redirectUri.trim();
+  try {
+    if (issuer && new URL(issuer).protocol !== "https:") {
+      throw new Error("The ADFS issuer must use HTTPS.");
+    }
+    if (redirectUri) {
+      const redirect = new URL(redirectUri);
+      if (redirect.protocol !== "https:" && redirect.hostname !== "localhost") {
+        throw new Error("The redirect URI must use HTTPS.");
+      }
+    }
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Invalid ADFS URL.",
+    });
+    return;
+  }
+
+  const [before] = await db
+    .select()
+    .from(adfsSettingsTable)
+    .where(eq(adfsSettingsTable.key, KEY));
+  const values = {
+    key: KEY,
+    enabled: input.enabled,
+    issuer,
+    clientId: input.clientId.trim(),
+    clientSecretEnc:
+      typeof input.clientSecret === "string" && input.clientSecret
+        ? encryptSecret(input.clientSecret)
+        : before?.clientSecretEnc ?? null,
+    redirectUri,
+    scope: input.scope.trim() || "openid profile email",
+    usernameClaim: input.usernameClaim.trim() || "upn",
+    autoProvision: input.autoProvision,
+  };
+  if (
+    values.enabled &&
+    (!values.issuer ||
+      !values.clientId ||
+      !values.clientSecretEnc ||
+      !values.redirectUri)
+  ) {
+    res.status(400).json({
+      error:
+        "Issuer, client ID, client secret, and redirect URI are required before enabling ADFS.",
+    });
+    return;
+  }
+
+  const [row] = await db
+    .insert(adfsSettingsTable)
+    .values(values)
+    .onConflictDoUpdate({ target: adfsSettingsTable.key, set: values })
+    .returning();
+  await audit(req, {
+    action: "settings.adfs_updated",
+    entityType: "settings",
+    entityId: null,
+    summary: `Updated ADFS settings (issuer=${row.issuer}, enabled=${row.enabled})`,
+    before: maskAdfs(before),
+    after: maskAdfs(row),
+  });
+  res.json(UpdateAdfsSettingsResponse.parse(maskAdfs(row)));
+});
+
+router.post("/settings/adfs/test", requireAdmin, async (req, res): Promise<void> => {
+  const result = await testAdfsConfiguration();
+  await audit(req, {
+    action: "settings.adfs_tested",
+    entityType: "settings",
+    entityId: null,
+    summary: `ADFS discovery test: ${result.success ? "success" : "failed"}`,
+    after: result,
+  });
+  res.json(TestAdfsSettingsResponse.parse(result));
 });
 
 function maskSsl(row: typeof sslSettingsTable.$inferSelect | undefined) {

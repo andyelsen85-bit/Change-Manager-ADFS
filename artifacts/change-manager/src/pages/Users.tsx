@@ -20,7 +20,7 @@ type EditUser = {
   username: string;
   email: string;
   fullName: string;
-  source: "local" | "ldap";
+  source: User["source"];
   isAdmin: boolean;
   isActive: boolean;
   notificationsEnabled: boolean;
@@ -186,11 +186,12 @@ export function UsersPage() {
                 <div className="grid gap-3 md:grid-cols-2">
                   <div className="space-y-2">
                     <Label>Source <span className="text-destructive">*</span></Label>
-                    <Select value={editing.source} onValueChange={(v) => setEditing({ ...editing, source: v as "local" | "ldap" })}>
+                    <Select value={editing.source} onValueChange={(v) => setEditing({ ...editing, source: v as User["source"] })}>
                       <SelectTrigger><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="local">Local</SelectItem>
                         <SelectItem value="ldap">LDAP</SelectItem>
+                        {editing.source === "adfs" && <SelectItem value="adfs">AD FS</SelectItem>}
                       </SelectContent>
                     </Select>
                   </div>

@@ -30,7 +30,8 @@ In **AD FS Management**:
    scenario.
 3. Give it a name such as `Change-it`.
 4. Record the generated **Client Identifier**.
-5. Create a client secret and store it in the deployment secret store.
+5. Create a client secret. You will enter it once in Change-it Settings, where
+   it is encrypted before being stored in PostgreSQL.
 6. Add this exact redirect URI:
    `https://<change-it-host>/api/auth/adfs/callback`
 
@@ -57,9 +58,41 @@ claim name.
 Start with a small test security group in the AD FS access policy. Do not grant
 the application to the whole directory until the round trip is verified.
 
-## 4. Configure the Change-it server
+## 4. Configure Change-it in Settings
 
-Add these values to the `.env` used by the **api** container:
+Sign in to Change-it as an administrator, then open **Settings → ADFS**.
+
+1. Enable AD FS authentication.
+2. Enter the issuer URL, client ID, and client secret from the application group.
+3. Enter the redirect URI registered in AD FS. The page proposes the current
+   Change-it origin followed by `/api/auth/adfs/callback` and provides a copy
+   button.
+4. Keep the default scopes (`openid profile email`) unless your AD FS
+   configuration requires a different set.
+5. Set the username claim to `upn`, or to the stable claim configured by your
+   issuance rules.
+6. Leave auto-provisioning disabled for the first test.
+7. Save the configuration, then select **Test configuration** to verify the
+   issuer discovery document and endpoints.
+
+The client secret is never returned to the browser after it is saved. Leaving
+the client-secret field blank on a later save preserves the stored secret.
+Replacing it requires entering the new secret.
+
+Keep auto-provisioning disabled for the first test. In this mode an
+administrator must create the user in Change-it first, with a username or
+email matching the AD FS `upn` / `email` claim. Existing local and LDAP users
+keep their existing source and roles; SSO only proves their identity.
+
+After the controlled test succeeds, auto-provisioning may be enabled if the
+desired policy is to create active, non-admin users automatically.
+Auto-provisioning requires an `email` claim and never grants admin or roles.
+
+### Environment-variable fallback
+
+For existing deployments, the API continues to support environment variables
+when no enabled database-backed AD FS configuration is available. Add these
+values to the `.env` used by the **api** container:
 
 ```dotenv
 ADFS_OIDC_ISSUER=https://fs.example.com/adfs
@@ -77,14 +110,7 @@ Restart the API after changing the values:
 docker compose up -d --build api
 ```
 
-Keep `ADFS_AUTO_PROVISION=false` for the first test. In this mode an
-administrator must create the user in Change-it first, with a username or
-email matching the ADFS `upn` / `email` claim. Existing local and LDAP users
-keep their existing source and roles; SSO only proves their identity.
-
-After the controlled test succeeds, `ADFS_AUTO_PROVISION=true` may be enabled
-if the desired policy is to create active, non-admin users automatically.
-Auto-provisioning requires an `email` claim and never grants admin or roles.
+Settings configuration takes precedence over these fallback values.
 
 ## 5. Test checklist
 
@@ -99,10 +125,12 @@ Auto-provisioning requires an `email` claim and never grants admin or roles.
 
 ## Troubleshooting
 
-- **`unavailable`**: one or more `ADFS_*` values are missing, or discovery
-  cannot be reached from the API container.
-- **AD FS redirect URI error**: the registered URI and
-  `ADFS_REDIRECT_URI` differ. Compare them character-for-character.
+- **`unavailable`**: the saved Settings configuration is incomplete or
+  disabled, the fallback `ADFS_*` values are incomplete, or discovery cannot
+  be reached from the API container.
+- **AD FS redirect URI error**: the registered URI and the URI saved in
+  Settings (or fallback `ADFS_REDIRECT_URI`) differ. Compare them
+  character-for-character.
 - **`not-provisioned`**: with auto-provisioning disabled, create/link the
   Change-it user first. Check the exact UPN and email values in the token.
 - **`invalid_client`**: verify the client ID and secret, and ensure the

@@ -210,7 +210,7 @@ importers:
         specifier: ^4.1.0
         version: 4.1.8(@types/node@25.3.5)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.8.3)
 
-  artifacts/change-mgmt:
+  artifacts/change-manager:
     devDependencies:
       '@hookform/resolvers':
         specifier: ^3.10.0
@@ -400,7 +400,7 @@ importers:
         version: 3.9.0(react@19.1.0)
       zod:
         specifier: 'catalog:'
-        version: 3.25.76
+        version: 4.3.6
 
   artifacts/mockup-sandbox:
     devDependencies:
@@ -583,7 +583,7 @@ importers:
         version: 7.3.2(@types/node@25.3.5)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)(yaml@2.8.3)
       zod:
         specifier: 'catalog:'
-        version: 3.25.76
+        version: 4.3.6
 
   lib/api-client-react:
     dependencies:
@@ -601,7 +601,7 @@ importers:
     dependencies:
       zod:
         specifier: 'catalog:'
-        version: 3.25.76
+        version: 4.3.6
 
   lib/db:
     dependencies:
@@ -616,7 +616,7 @@ importers:
         version: 8.20.0
       zod:
         specifier: 'catalog:'
-        version: 3.25.76
+        version: 4.3.6
     devDependencies:
       '@types/node':
         specifier: 'catalog:'

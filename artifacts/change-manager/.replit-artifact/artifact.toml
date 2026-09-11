@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Change Manager"
+description = "An internal change-management platform with local and LDAP login, Microsoft ADFS SSO, CAB approvals, audit trails, and administrator-configurable identity settings."
+version = "1.0.0"
+id = "artifacts/change-manager"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22726
+
+[services.development]
+run = "pnpm --filter @workspace/change-manager run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/change-manager", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/change-manager/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22726"
+BASE_PATH = "/"
