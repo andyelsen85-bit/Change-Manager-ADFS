@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [api, web]
+        target: [builder, api, web]
 
     steps:
       - name: Check out repository
