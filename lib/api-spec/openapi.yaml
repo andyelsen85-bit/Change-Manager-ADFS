@@ -1460,7 +1460,7 @@ components:
         clientId: { type: string }
         clientSecret:
           type: ["string", "null"]
-          description: "A non-empty value replaces the encrypted secret; null or an empty value keeps the existing secret."
+          description: "Optional for PKCE public clients. A non-empty value replaces the encrypted secret; null or an empty value keeps the existing secret."
         redirectUri: { type: string }
         scope: { type: string }
         usernameClaim: { type: string }

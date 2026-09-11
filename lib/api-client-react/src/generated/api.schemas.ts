@@ -915,7 +915,7 @@ export interface AdfsSettingsUpdate {
   issuer: string;
   clientId: string;
   /**
-     * A non-empty value replaces the encrypted secret; null or an empty value keeps the existing secret.
+     * Optional for PKCE public clients. A non-empty value replaces the encrypted secret; null or an empty value keeps the existing secret.
      * @nullable
      */
   clientSecret?: string | null;

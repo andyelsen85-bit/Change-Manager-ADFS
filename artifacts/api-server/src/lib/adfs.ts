@@ -88,7 +88,6 @@ export async function isAdfsConfigured(): Promise<boolean> {
     config.enabled &&
       config.issuer &&
       config.clientId &&
-      config.clientSecret &&
       config.redirectUri,
   );
 }
@@ -98,7 +97,6 @@ function requireConfiguration(config: AdfsRuntimeConfig): void {
     !config.enabled ||
     !config.issuer ||
     !config.clientId ||
-    !config.clientSecret ||
     !config.redirectUri
   ) {
     throw new Error(
@@ -222,11 +220,13 @@ async function exchangeCode(
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     client_id: config.clientId,
-    client_secret: config.clientSecret,
     code,
     redirect_uri: config.redirectUri,
     code_verifier: state.codeVerifier,
   });
+  if (config.clientSecret) {
+    body.set("client_secret", config.clientSecret);
+  }
   const response = await fetch(discovery.token_endpoint, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },

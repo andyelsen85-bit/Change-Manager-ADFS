@@ -26,18 +26,20 @@ Open it in a browser and confirm it contains `authorization_endpoint`,
 In **AD FS Management**:
 
 1. Open **Application Groups** and choose **Add Application Group**.
-2. Select the server-side web application / web browser OpenID Connect
-   scenario.
+2. Select the **Web browser accessing a web application** OpenID Connect
+   scenario. A public client without a secret is supported when AD FS is
+   configured to allow authorization-code exchange with PKCE.
 3. Give it a name such as `Change-it`.
 4. Record the generated **Client Identifier**.
-5. Create a client secret. You will enter it once in Change-it Settings, where
-   it is encrypted before being stored in PostgreSQL.
+5. If the AD FS application is a confidential server client, create a client
+   secret. Public clients using PKCE can omit the secret.
 6. Add this exact redirect URI:
    `https://<change-it-host>/api/auth/adfs/callback`
 
 The URI must match character-for-character, including HTTPS, hostname, path,
 and trailing slash behavior. The application uses the authorization-code flow
-with PKCE; it does not expose the client secret to the browser.
+with PKCE. When a confidential-client secret is configured, it is used only by
+the API during token exchange and is never exposed to the browser.
 
 ## 3. Issue the identity claims
 
@@ -63,7 +65,9 @@ the application to the whole directory until the round trip is verified.
 Sign in to Change-it as an administrator, then open **Settings → ADFS**.
 
 1. Enable AD FS authentication.
-2. Enter the issuer URL, client ID, and client secret from the application group.
+2. Enter the issuer URL and client ID from the application group. Enter the
+   client secret only for a confidential server client; leave it blank for a
+   public PKCE client.
 3. Enter the redirect URI registered in AD FS. The page proposes the current
    Change-it origin followed by `/api/auth/adfs/callback` and provides a copy
    button.
@@ -75,9 +79,9 @@ Sign in to Change-it as an administrator, then open **Settings → ADFS**.
 7. Save the configuration, then select **Test configuration** to verify the
    issuer discovery document and endpoints.
 
-The client secret is never returned to the browser after it is saved. Leaving
-the client-secret field blank on a later save preserves the stored secret.
-Replacing it requires entering the new secret.
+When used, the client secret is never returned to the browser after it is
+saved. Leaving the client-secret field blank on a later save preserves the
+stored secret. Replacing it requires entering the new secret.
 
 Keep auto-provisioning disabled for the first test. In this mode an
 administrator must create the user in Change-it first, with a username or
@@ -97,7 +101,8 @@ values to the `.env` used by the **api** container:
 ```dotenv
 ADFS_OIDC_ISSUER=https://fs.example.com/adfs
 ADFS_CLIENT_ID=<client-id-from-adfs>
-ADFS_CLIENT_SECRET=<client-secret-from-adfs>
+# Optional for a public PKCE client
+ADFS_CLIENT_SECRET=
 ADFS_REDIRECT_URI=https://<change-it-host>/api/auth/adfs/callback
 ADFS_SCOPE=openid profile email
 ADFS_USERNAME_CLAIM=upn
@@ -133,8 +138,9 @@ Settings configuration takes precedence over these fallback values.
   character-for-character.
 - **`not-provisioned`**: with auto-provisioning disabled, create/link the
   Change-it user first. Check the exact UPN and email values in the token.
-- **`invalid_client`**: verify the client ID and secret, and ensure the
-  secret has not expired.
+- **`invalid_client`**: verify the client ID. For a confidential client, also
+  verify the secret and ensure it has not expired. For a public client, confirm
+  AD FS permits token exchange without client authentication and supports PKCE.
 - **Nonce or state errors**: verify that the browser is returning to the same
   hostname and that cookies are enabled. The callback must be reached on the
   same HTTPS host that started the login.

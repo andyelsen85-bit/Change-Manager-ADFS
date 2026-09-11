@@ -10,6 +10,8 @@ export type AuthTokenGetter = () => Promise<string | null> | string | null;
 
 const NO_BODY_STATUS = new Set([204, 205, 304]);
 const DEFAULT_JSON_ACCEPT = "application/json, application/problem+json";
+const CSRF_COOKIE_NAME = "cm_csrf";
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 // ---------------------------------------------------------------------------
 // Module-level configuration
@@ -89,6 +91,21 @@ function mergeHeaders(...sources: Array<HeadersInit | undefined>): Headers {
   }
 
   return headers;
+}
+
+function readBrowserCookie(name: string): string | null {
+  if (typeof document === "undefined" || !document.cookie) return null;
+  for (const entry of document.cookie.split("; ")) {
+    const separator = entry.indexOf("=");
+    if (separator < 0 || entry.slice(0, separator) !== name) continue;
+    const value = entry.slice(separator + 1);
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  }
+  return null;
 }
 
 function getMediaType(headers: Headers): string | null {
@@ -358,9 +375,24 @@ export async function customFetch<T = unknown>(
     }
   }
 
+  const browserRequest = typeof document !== "undefined";
+  if (
+    browserRequest &&
+    !SAFE_METHODS.has(method) &&
+    !headers.has("x-csrf-token")
+  ) {
+    const csrfToken = readBrowserCookie(CSRF_COOKIE_NAME);
+    if (csrfToken) headers.set("x-csrf-token", csrfToken);
+  }
+
   const requestInfo = { method, url: resolveUrl(input) };
 
-  const response = await fetch(input, { ...init, method, headers });
+  const response = await fetch(input, {
+    ...init,
+    method,
+    headers,
+    credentials: init.credentials ?? (browserRequest ? "include" : undefined),
+  });
 
   if (!response.ok) {
     const errorData = await parseErrorBody(response, method);

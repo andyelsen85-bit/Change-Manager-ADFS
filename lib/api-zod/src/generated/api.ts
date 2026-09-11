@@ -1270,7 +1270,7 @@ export const UpdateAdfsSettingsBody = zod.object({
   "enabled": zod.boolean(),
   "issuer": zod.string(),
   "clientId": zod.string(),
-  "clientSecret": zod.string().nullish().describe('A non-empty value replaces the encrypted secret; null or an empty value keeps the existing secret.'),
+  "clientSecret": zod.string().nullish().describe('Optional for PKCE public clients. A non-empty value replaces the encrypted secret; null or an empty value keeps the existing secret.'),
   "redirectUri": zod.string(),
   "scope": zod.string(),
   "usernameClaim": zod.string(),

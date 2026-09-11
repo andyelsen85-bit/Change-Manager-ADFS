@@ -178,6 +178,9 @@ export function useHealthCheck<TData = Awaited<ReturnType<typeof healthCheck>>, 
 
   return withQueryKey(query, queryOptions.queryKey);
 }
+
+
+
 export const getLoginUrl = () => {
 
 
@@ -329,6 +332,13 @@ export function useGetSetupStatus<TData = Awaited<ReturnType<typeof getSetupStat
 
   return withQueryKey(query, queryOptions.queryKey);
 }
+
+
+
+
+
+
+
 export const getCompleteSetupUrl = () => {
 
 
@@ -547,8 +557,14 @@ export function useGetMe<TData = Awaited<ReturnType<typeof getMe>>, TError = Err
 
   const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
 
-   return withQueryKey(query, queryOptions.queryKey);
+  return withQueryKey(query, queryOptions.queryKey);
 }
+
+
+
+
+
+
 
 export const getChangePasswordUrl = () => {
 
@@ -5040,3 +5056,4 @@ export function useExportAuditLog<TData = Awaited<ReturnType<typeof exportAuditL
 
   return withQueryKey(query, queryOptions.queryKey);
 }
+

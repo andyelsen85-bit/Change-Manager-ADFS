@@ -311,12 +311,11 @@ router.put("/settings/adfs", requireAdmin, async (req, res): Promise<void> => {
     values.enabled &&
     (!values.issuer ||
       !values.clientId ||
-      !values.clientSecretEnc ||
       !values.redirectUri)
   ) {
     res.status(400).json({
       error:
-        "Issuer, client ID, client secret, and redirect URI are required before enabling ADFS.",
+        "Issuer, client ID, and redirect URI are required before enabling ADFS.",
     });
     return;
   }
