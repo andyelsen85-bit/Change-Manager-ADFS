@@ -16,8 +16,10 @@ if (NODE_ENV === "production" && (!RAW_SECRET || RAW_SECRET.length < 16)) {
 const JWT_SECRET = RAW_SECRET ?? "dev-only-change-mgmt-secret-do-not-use-in-prod";
 const COOKIE_NAME = "cm_session";
 const CSRF_COOKIE_NAME = "cm_csrf";
+const LOGIN_METHOD_COOKIE_NAME = "cm_login_method";
 const CSRF_HEADER_NAME = "x-csrf-token";
 const TOKEN_TTL_SECONDS = 60 * 60 * 12;
+const LOGIN_METHOD_TTL_SECONDS = 60 * 60 * 24 * 365;
 
 export type SessionPayload = {
   uid: number;
@@ -122,6 +124,21 @@ export function setCsrfCookie(req: Request, res: Response, token: string): void 
 
 export function clearCsrfCookie(res: Response): void {
   res.clearCookie(CSRF_COOKIE_NAME, { path: "/" });
+}
+
+export function setAdfsLoginPreference(req: Request, res: Response): void {
+  const { sameSite, secure } = cookieChannelOptions(req);
+  res.cookie(LOGIN_METHOD_COOKIE_NAME, "adfs", {
+    httpOnly: false,
+    sameSite,
+    secure,
+    maxAge: LOGIN_METHOD_TTL_SECONDS * 1000,
+    path: "/",
+  });
+}
+
+export function clearLoginMethodPreference(res: Response): void {
+  res.clearCookie(LOGIN_METHOD_COOKIE_NAME, { path: "/" });
 }
 
 export function readCsrfCookie(req: Request): string | null {

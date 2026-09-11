@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import type { Request, Response } from "express";
 
 const selectMock = vi.fn();
 const fromMock = vi.fn();
@@ -32,6 +33,8 @@ import {
   getChangeAccess,
   isPrivilegedAccess,
   GOVERNANCE_ROLES,
+  setAdfsLoginPreference,
+  clearLoginMethodPreference,
   type SessionPayload,
 } from "./auth";
 
@@ -134,5 +137,30 @@ describe("isPrivilegedAccess", () => {
     expect(isPrivilegedAccess("owner")).toBe(false);
     expect(isPrivilegedAccess("assignee")).toBe(false);
     expect(isPrivilegedAccess(null)).toBe(false);
+  });
+});
+
+describe("ADFS login preference cookie", () => {
+  it("remembers ADFS without storing an authentication token", () => {
+    const cookie = vi.fn();
+    setAdfsLoginPreference(
+      { secure: true, protocol: "https" } as Request,
+      { cookie } as unknown as Response,
+    );
+    expect(cookie).toHaveBeenCalledWith(
+      "cm_login_method",
+      "adfs",
+      expect.objectContaining({
+        httpOnly: false,
+        secure: true,
+        path: "/",
+      }),
+    );
+  });
+
+  it("removes the preference on explicit logout", () => {
+    const clearCookie = vi.fn();
+    clearLoginMethodPreference({ clearCookie } as unknown as Response);
+    expect(clearCookie).toHaveBeenCalledWith("cm_login_method", { path: "/" });
   });
 });

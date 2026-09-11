@@ -116,6 +116,16 @@ After the controlled test succeeds, auto-provisioning may be enabled if the
 desired policy is to create active, non-admin users automatically.
 Auto-provisioning requires an `email` claim and never grants admin or roles.
 
+### Automatic AD FS reauthentication
+
+After a successful AD FS login, Change-it stores only a non-sensitive
+`cm_login_method=adfs` preference cookie. When the 12-hour Change-it session
+expires, the browser automatically starts AD FS login once. If the user's AD FS
+SSO session is still valid, AD FS normally returns without asking for
+credentials; otherwise AD FS shows its login page. Change-it does not store the
+AD FS ID token, access token, or refresh token. Selecting **Logout** explicitly
+clears both the Change-it session and the remembered AD FS login preference.
+
 ### Environment-variable fallback
 
 For existing deployments, the API continues to support environment variables

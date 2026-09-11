@@ -17,6 +17,28 @@ type AuthContextValue = {
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
+const LOGIN_METHOD_COOKIE_NAME = "cm_login_method";
+const ADFS_AUTO_ATTEMPT_KEY = "cm_adfs_auto_attempted";
+
+function hasAdfsLoginPreference(): boolean {
+  return document.cookie
+    .split("; ")
+    .some((entry) => entry === `${LOGIN_METHOD_COOKIE_NAME}=adfs`);
+}
+
+function tryAutomaticAdfsLogin(): boolean {
+  const adfsResult = new URLSearchParams(window.location.search).get("adfs");
+  if (
+    adfsResult ||
+    !hasAdfsLoginPreference() ||
+    sessionStorage.getItem(ADFS_AUTO_ATTEMPT_KEY) === "true"
+  ) {
+    return false;
+  }
+  sessionStorage.setItem(ADFS_AUTO_ATTEMPT_KEY, "true");
+  window.location.assign("/api/auth/adfs/start");
+  return true;
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -27,8 +49,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const me = await api.get<SessionUser>("/auth/me");
       setUser(me);
+      sessionStorage.removeItem(ADFS_AUTO_ATTEMPT_KEY);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
+        if (tryAutomaticAdfsLogin()) return;
         setUser(null);
       } else {
         setUser(null);
@@ -56,7 +80,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // server-side session expired. Clear auth immediately so ProtectedRoutes
   // redirects to /login instead of leaving an empty page behind.
   useEffect(() => {
-    const handleSessionExpired = () => setUser(null);
+    const handleSessionExpired = () => {
+      if (!tryAutomaticAdfsLogin()) setUser(null);
+    };
     window.addEventListener(SESSION_EXPIRED_EVENT, handleSessionExpired);
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, handleSessionExpired);
   }, []);
@@ -98,6 +124,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch {
       // ignore
     }
+    document.cookie = `${LOGIN_METHOD_COOKIE_NAME}=; Max-Age=0; Path=/`;
+    sessionStorage.removeItem(ADFS_AUTO_ATTEMPT_KEY);
     setUser(null);
   }, []);
 

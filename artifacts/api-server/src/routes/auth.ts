@@ -13,6 +13,8 @@ import {
   setCsrfCookie,
   clearCsrfCookie,
   readCsrfCookie,
+  setAdfsLoginPreference,
+  clearLoginMethodPreference,
 } from "../lib/auth";
 import { audit } from "../lib/audit";
 import { authenticateLdap, getLdap } from "../lib/ldap";
@@ -87,6 +89,7 @@ router.get("/auth/adfs/callback", async (req, res): Promise<void> => {
     const token = signSession({ uid: existing.id, username: existing.username, isAdmin: existing.isAdmin });
     setSessionCookie(req, res, token);
     setCsrfCookie(req, res, generateCsrfToken());
+    setAdfsLoginPreference(req, res);
     await audit(
       req,
       {
@@ -269,6 +272,7 @@ router.post("/auth/logout", async (req, res): Promise<void> => {
   const session = readSessionCookie(req);
   clearSessionCookie(res);
   clearCsrfCookie(res);
+  clearLoginMethodPreference(res);
   if (session) {
     await audit(req, {
       action: "auth.logout",
