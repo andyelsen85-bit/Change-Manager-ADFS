@@ -8,7 +8,7 @@ type AuthContextValue = {
   // True until both /auth/me and /auth/setup-status have settled.
   needsSetup: boolean;
   login: (username: string, password: string) => Promise<void>;
-  loginWithAdfs: () => void;
+  loginWithAdfs: (returnTo?: string) => void;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   // Performs first-time setup, claiming the seeded admin account with the
@@ -26,6 +26,37 @@ function hasAdfsLoginPreference(): boolean {
     .some((entry) => entry === `${LOGIN_METHOD_COOKIE_NAME}=adfs`);
 }
 
+export function safeReturnPath(value: string | null | undefined): string {
+  if (
+    !value ||
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return "/";
+  }
+  try {
+    const parsed = new URL(value, window.location.origin);
+    if (parsed.origin !== window.location.origin) return "/";
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return "/";
+  }
+}
+
+export function requestedReturnPath(): string {
+  const requested = new URLSearchParams(window.location.search).get("returnTo");
+  if (requested) return safeReturnPath(requested);
+  const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  return safeReturnPath(current);
+}
+
+function startAdfsLogin(returnTo: string): void {
+  const query = new URLSearchParams({ returnTo: safeReturnPath(returnTo) });
+  window.location.assign(`/api/auth/adfs/start?${query.toString()}`);
+}
+
 function tryAutomaticAdfsLogin(): boolean {
   const adfsResult = new URLSearchParams(window.location.search).get("adfs");
   if (
@@ -36,7 +67,7 @@ function tryAutomaticAdfsLogin(): boolean {
     return false;
   }
   sessionStorage.setItem(ADFS_AUTO_ATTEMPT_KEY, "true");
-  window.location.assign("/api/auth/adfs/start");
+  startAdfsLogin(requestedReturnPath());
   return true;
 }
 
@@ -95,8 +126,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const loginWithAdfs = useCallback(() => {
-    window.location.assign("/api/auth/adfs/start");
+  const loginWithAdfs = useCallback((returnTo = requestedReturnPath()) => {
+    startAdfsLogin(returnTo);
   }, []);
 
   const setup = useCallback(

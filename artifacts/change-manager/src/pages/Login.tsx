@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useLocation } from "wouter";
 import { Loader2 } from "lucide-react";
-import { useAuth } from "@/lib/auth-context";
+import { requestedReturnPath, useAuth } from "@/lib/auth-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -37,7 +37,7 @@ export function LoginPage() {
     setBusy(true);
     try {
       await login(username.trim(), password);
-      setLocation("/");
+      setLocation(requestedReturnPath());
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -131,7 +131,7 @@ export function LoginPage() {
               onClick={() => {
                 setError(null);
                 setAdfsBusy(true);
-                loginWithAdfs();
+                loginWithAdfs(requestedReturnPath());
               }}
               data-testid="button-adfs-login"
             >

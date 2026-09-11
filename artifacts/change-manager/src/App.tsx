@@ -1,7 +1,7 @@
 import { Route, Switch, Redirect, useLocation } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/sonner";
-import { AuthProvider, useAuth } from "@/lib/auth-context";
+import { AuthProvider, requestedReturnPath, safeReturnPath, useAuth } from "@/lib/auth-context";
 import { ThemeProvider } from "@/lib/theme-context";
 import { AppShell } from "@/components/AppShell";
 import { LoginPage } from "@/pages/Login";
@@ -62,12 +62,20 @@ function ProtectedRoutes() {
   }
   if (!user) {
     if (location === "/setup") return <Redirect to="/login" />;
-    if (location !== "/login") return <Redirect to="/login" />;
+    if (location !== "/login") {
+      const returnTo = requestedReturnPath();
+      return <Redirect to={`/login?returnTo=${encodeURIComponent(returnTo)}`} />;
+    }
     return <LoginPage />;
   }
   // /setup is meaningless once the user is authenticated.
   if (location === "/setup") return <Redirect to="/" />;
-  if (location === "/login") return <Redirect to="/" />;
+  if (location === "/login") {
+    const returnTo = safeReturnPath(
+      new URLSearchParams(window.location.search).get("returnTo"),
+    );
+    return <Redirect to={returnTo} />;
+  }
   // Force users who must change their password (e.g. operators promoted by
   // an admin and given a temporary password) onto the Profile page until
   // they rotate. The Profile page surfaces a banner when the flag is true.

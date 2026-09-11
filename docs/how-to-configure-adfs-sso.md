@@ -126,6 +126,11 @@ credentials; otherwise AD FS shows its login page. Change-it does not store the
 AD FS ID token, access token, or refresh token. Selecting **Logout** explicitly
 clears both the Change-it session and the remembered AD FS login preference.
 
+Direct application links are preserved through authentication. For example, an
+unauthenticated link to `/changes/123` is carried inside the signed, short-lived
+AD FS state and the user is returned to that change after successful login.
+Only validated local paths are accepted, preventing external redirect URLs.
+
 ### Environment-variable fallback
 
 For existing deployments, the API continues to support environment variables

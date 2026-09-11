@@ -23,6 +23,7 @@ type AdfsState = {
   state: string;
   nonce: string;
   codeVerifier: string;
+  returnPath: string;
 };
 
 export type AdfsClaims = {
@@ -178,6 +179,26 @@ function base64Url(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("base64url");
 }
 
+export function sanitizeAdfsReturnPath(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return "/";
+  }
+  try {
+    const base = new URL("https://change-it.invalid");
+    const parsed = new URL(value, base);
+    if (parsed.origin !== base.origin) return "/";
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return "/";
+  }
+}
+
 function readClaim(claims: Record<string, unknown>, ...names: string[]): string | null {
   for (const name of names) {
     const value = claims[name];
@@ -216,7 +237,8 @@ export async function beginAdfsLogin(req: Request, res: Response): Promise<void>
   const nonce = base64Url(randomBytes(32));
   const codeVerifier = base64Url(randomBytes(32));
   const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
-  const signedState = signAuthState({ state, nonce, codeVerifier });
+  const returnPath = sanitizeAdfsReturnPath(req.query.returnTo);
+  const signedState = signAuthState({ state, nonce, codeVerifier, returnPath });
   res.cookie(STATE_COOKIE, signedState, cookieOptions(req));
 
   const url = new URL(discovery.authorization_endpoint);
@@ -297,14 +319,18 @@ async function validateIdToken(
   return extractAdfsClaims(payload, config.usernameClaim);
 }
 
-export async function finishAdfsLogin(req: Request, res: Response): Promise<AdfsClaims> {
+export async function finishAdfsLogin(
+  req: Request,
+  res: Response,
+): Promise<{ claims: AdfsClaims; returnPath: string }> {
   const state = readState(req);
   res.clearCookie(STATE_COOKIE, { path: "/api/auth/adfs" });
   if (typeof req.query.code !== "string" || !req.query.code) throw new Error("ADFS did not return an authorization code");
   const config = await getAdfsConfiguration();
   const discovery = await getDiscovery(config);
   const idToken = await exchangeCode(req.query.code, state, discovery, config);
-  return validateIdToken(idToken, state, discovery, config);
+  const claims = await validateIdToken(idToken, state, discovery, config);
+  return { claims, returnPath: sanitizeAdfsReturnPath(state.returnPath) };
 }
 
 export async function testAdfsConfiguration(): Promise<{

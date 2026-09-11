@@ -39,7 +39,7 @@ router.get("/auth/adfs/start", async (req, res): Promise<void> => {
 
 router.get("/auth/adfs/callback", async (req, res): Promise<void> => {
   try {
-    const claims = await finishAdfsLogin(req, res);
+    const { claims, returnPath } = await finishAdfsLogin(req, res);
     const adfsConfig = await getAdfsConfiguration();
     const candidates = Array.from(
       new Set([claims.username, claims.email ?? "", claims.username.split("@")[0]].filter(Boolean)),
@@ -101,7 +101,7 @@ router.get("/auth/adfs/callback", async (req, res): Promise<void> => {
       },
       { id: existing.id, name: existing.username },
     );
-    res.redirect("/");
+    res.redirect(returnPath);
   } catch (err) {
     req.log?.warn({ err }, "ADFS callback failed");
     res.redirect("/login?adfs=error");
