@@ -1,0 +1,17 @@
+.agents
+.conversation
+.git
+.local
+.env
+.env.*
+!.env.example
+node_modules
+**/node_modules
+dist
+**/dist
+coverage
+**/coverage
+*.log
+screenshots
+tmp
+*.tsbuildinfo

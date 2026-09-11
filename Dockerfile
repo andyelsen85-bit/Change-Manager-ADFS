@@ -20,6 +20,7 @@ COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc* ./
 COPY artifacts/api-server/package.json artifacts/api-server/package.json
 COPY artifacts/change-manager/package.json artifacts/change-manager/package.json
 COPY lib/db/package.json lib/db/package.json
+COPY lib/api-client-react/package.json lib/api-client-react/package.json
 COPY lib/api-zod/package.json lib/api-zod/package.json
 COPY lib/api-spec/package.json lib/api-spec/package.json
 
