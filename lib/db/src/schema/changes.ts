@@ -1,0 +1,72 @@
+import { pgTable, serial, text, integer, timestamp, boolean } from "drizzle-orm/pg-core";
+
+export const changeRequestsTable = pgTable("change_requests", {
+  id: serial("id").primaryKey(),
+  ref: text("ref").notNull(),
+  title: text("title").notNull(),
+  description: text("description").notNull().default(""),
+  track: text("track").notNull(),
+  status: text("status").notNull().default("draft"),
+  risk: text("risk").notNull().default("low"),
+  impact: text("impact").notNull().default("low"),
+  priority: text("priority").notNull().default("medium"),
+  category: text("category").notNull().default("general"),
+  // Optional pre-prod testing flag (Normal track). When true the workflow
+  // includes an `in_preprod_testing` step before `scheduled` which the
+  // Implementer drives.
+  hasPreprodEnv: boolean("has_preprod_env").notNull().default(false),
+  preprodEnvUrl: text("preprod_env_url"),
+  // Optional free-text link to an external ticket (e.g. ServiceNow / Jira / GLPI).
+  ticketLink: text("ticket_link"),
+  // ServiceDesk Plus request ID when the change was opened from an SD+ RFC
+  // ticket (via the inbound webhook). Drives the automatic resolve/reject
+  // write-back when the change reaches a terminal state.
+  sdpRequestId: text("sdp_request_id"),
+  // Mandatory reason captured when a change is cancelled or rejected. Shown
+  // on the change detail page and written back into the SD+ resolution field.
+  // Cleared when a cancelled/rejected change is reopened to draft.
+  closureNote: text("closure_note"),
+  // Who requested the change. requesterType is 'internal' (picked from the AD
+  // directory) or 'external' (free-text). requesterName holds the chosen
+  // directory display name or the free-text value. Both nullable — optional.
+  requesterType: text("requester_type"),
+  requesterName: text("requester_name"),
+  // Stable local identity for an internal requester. The display name remains
+  // useful for external/LDAP-only requesters, while this supports reliable
+  // per-user request lists when the directory account exists locally.
+  requesterUserId: integer("requester_user_id"),
+  // Immutable author of the RFC. ownerId predates distinct creator/owner
+  // semantics and is retained for compatibility with existing records.
+  createdById: integer("created_by_id"),
+  ownerId: integer("owner_id").notNull(),
+  assigneeId: integer("assignee_id"),
+  templateId: integer("template_id"),
+  // "Potential Standard Change" marker on NORMAL changes: links the change to
+  // a DISABLED standard template that is being trialled. Once enough linked
+  // changes complete successfully (global promotion threshold), the CAB is
+  // flagged so it can decide to enable the template as a real standard change.
+  potentialTemplateId: integer("potential_template_id"),
+  // A re-change keeps a durable link to the failed/original change while
+  // intentionally retaining its own workflow records and evidence.
+  parentChangeId: integer("parent_change_id"),
+  cabMeetingId: integer("cab_meeting_id"),
+  plannedStart: timestamp("planned_start", { withTimezone: true }),
+  plannedEnd: timestamp("planned_end", { withTimezone: true }),
+  actualStart: timestamp("actual_start", { withTimezone: true }),
+  actualEnd: timestamp("actual_end", { withTimezone: true }),
+  // Set once the <10-days-left PIR reminder has been emailed so the daily
+  // check never sends the same escalation twice for one change.
+  pirReminderSentAt: timestamp("pir_reminder_sent_at", { withTimezone: true }),
+  // Soft delete (recycle bin). A non-null deletedAt hides the change from every
+  // list/detail endpoint; admins can restore it or purge it permanently.
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  deletedById: integer("deleted_by_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
+
+export type ChangeRow = typeof changeRequestsTable.$inferSelect;
+export type InsertChange = typeof changeRequestsTable.$inferInsert;

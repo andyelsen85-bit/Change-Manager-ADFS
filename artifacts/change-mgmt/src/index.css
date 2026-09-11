@@ -1,0 +1,212 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-success: hsl(var(--success));
+  --color-success-foreground: hsl(var(--success-foreground));
+
+  --color-warning: hsl(var(--warning));
+  --color-warning-foreground: hsl(var(--warning-foreground));
+
+  --color-info: hsl(var(--info));
+  --color-info-foreground: hsl(var(--info-foreground));
+
+  --color-sidebar: hsl(var(--sidebar));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/*
+ * CHdN brand palette (charte graphique):
+ *   Greens   #96B423 (74° 67 42)  primary       #BDCD23 (65° 71 47)  lime
+ *   Yellows  #D7E178 (66° 60 68)  pale          #F0F055 (60° 84 64)  bright
+ *   Earths   #C8963C (38° 56 51)  ochre         #966E3C (30° 43 41)  brown (accent)
+ *            #BEA57D (35° 35 62)  sand
+ *
+ * The logo's wave gradient runs from the olive green into the brown, so we
+ * lean on those two as primary + accent and use the sandy/yellow tones for
+ * supporting surfaces (badges, soft backgrounds, status pills).
+ */
+:root {
+  --background: 60 30% 98%;       /* warm off-white, picks up the sand tone */
+  --foreground: 30 25% 12%;       /* dark espresso instead of cool slate */
+  --card: 0 0% 100%;
+  --card-foreground: 30 25% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 30 25% 12%;
+
+  --primary: 74 67% 42%;          /* CHdN olive green #96B423 */
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 35 35% 92%;        /* very pale sand */
+  --secondary-foreground: 30 35% 18%;
+
+  --muted: 60 25% 94%;
+  --muted-foreground: 30 12% 38%;
+
+  --accent: 30 43% 41%;           /* CHdN brown #966E3C */
+  --accent-foreground: 0 0% 100%;
+
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+  --success: 74 67% 36%;          /* slightly darker than primary so badges read */
+  --success-foreground: 0 0% 100%;
+  --warning: 38 56% 51%;          /* CHdN ochre #C8963C */
+  --warning-foreground: 0 0% 100%;
+  --info: 35 35% 50%;             /* tan, used sparingly */
+  --info-foreground: 0 0% 100%;
+
+  --border: 35 25% 86%;
+  --input: 35 25% 86%;
+  --ring: 74 67% 42%;
+  --radius: 0.5rem;
+
+  /* Sidebar uses the actual CHdN brand brown (#966E3C, 30° 43 41) so the
+     two signature colors — green primary, brown rail — read together
+     across the whole app. The brand green is the active-item highlight,
+     mirroring the wave inside the logo. */
+  --sidebar: 30 43% 22%;                    /* darker brown, easier on eyes */
+  --sidebar-foreground: 35 35% 95%;
+  --sidebar-border: 30 35% 30%;
+  --sidebar-accent: 30 40% 30%;
+  --sidebar-accent-foreground: 60 30% 98%;
+  --sidebar-primary: 74 67% 55%;
+  --sidebar-primary-foreground: 30 43% 18%;
+  --sidebar-ring: 74 67% 55%;
+
+  /* Charts span the brand palette in order — green, lime, ochre, brown,
+     sand — so analytics screens stay on-brand without re-mapping. */
+  --chart-1: 74 67% 42%;          /* green */
+  --chart-2: 65 71% 47%;          /* lime */
+  --chart-3: 38 56% 51%;          /* ochre */
+  --chart-4: 30 43% 41%;          /* brown */
+  --chart-5: 35 35% 62%;          /* sand */
+}
+
+.dark {
+  --background: 30 25% 7%;
+  --foreground: 35 25% 92%;
+  --card: 30 25% 10%;
+  --card-foreground: 35 25% 92%;
+  --popover: 30 25% 10%;
+  --popover-foreground: 35 25% 92%;
+
+  --primary: 74 67% 50%;          /* lifted green so it pops on dark */
+  --primary-foreground: 30 30% 10%;
+
+  --secondary: 30 20% 18%;
+  --secondary-foreground: 35 25% 92%;
+
+  --muted: 30 18% 15%;
+  --muted-foreground: 35 15% 65%;
+
+  --accent: 30 43% 50%;           /* lifted brown */
+  --accent-foreground: 30 30% 10%;
+
+  --destructive: 0 63% 55%;
+  --destructive-foreground: 0 0% 100%;
+  --success: 74 67% 45%;
+  --success-foreground: 30 30% 10%;
+  --warning: 38 56% 56%;
+  --warning-foreground: 30 30% 10%;
+  --info: 35 35% 60%;
+  --info-foreground: 30 30% 10%;
+
+  --border: 30 18% 20%;
+  --input: 30 18% 20%;
+  --ring: 74 67% 50%;
+
+  --sidebar: 30 43% 14%;
+  --sidebar-foreground: 35 35% 95%;
+  --sidebar-border: 30 35% 22%;
+  --sidebar-accent: 30 40% 22%;
+  --sidebar-accent-foreground: 60 30% 98%;
+  --sidebar-primary: 74 67% 55%;
+  --sidebar-primary-foreground: 30 43% 14%;
+  --sidebar-ring: 74 67% 55%;
+
+  --chart-1: 74 67% 50%;
+  --chart-2: 65 71% 55%;
+  --chart-3: 38 56% 58%;
+  --chart-4: 30 43% 50%;
+  --chart-5: 35 35% 65%;
+}
+
+/*
+ * The CHdN brand mark (a crossed wave that fades from olive green into
+ * warm brown). Used as a slim divider on the login splash + as a subtle
+ * decoration on dashboard hero areas. Pure CSS so it scales without an
+ * extra image request.
+ */
+.brand-wave {
+  height: 6px;
+  width: 100%;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    hsl(74 67% 42%) 0%,
+    hsl(65 71% 47%) 25%,
+    hsl(38 56% 51%) 65%,
+    hsl(30 43% 41%) 100%
+  );
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}

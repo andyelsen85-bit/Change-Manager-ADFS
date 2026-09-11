@@ -1,0 +1,1488 @@
+import { Router, type IRouter } from "express";
+import { and, desc, eq, ilike, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import {
+  db,
+  changeRequestsTable,
+  usersTable,
+  standardTemplatesTable,
+  planningRecordsTable,
+  testRecordsTable,
+  pirRecordsTable,
+  approvalsTable,
+  commentsTable,
+  rolesTable,
+  roleAssignmentsTable,
+  cabMeetingsTable,
+  cabChangesTable,
+  discussionReadsTable,
+  changeAssigneesTable,
+  attachmentsTable,
+  auditLogTable,
+} from "@workspace/db";
+import { requireAuth, requireAdmin, getChangeAccess, getChangeViewAccess, isPrivilegedAccess, loadUserRoles } from "../lib/auth";
+import { audit } from "../lib/audit";
+import { nextRef } from "../lib/ref";
+import { getPromotionStatus } from "../lib/template-promotion";
+import { sdpSyncTerminalState } from "../lib/sdp";
+import { notify, getUserEmail, getUserEmails } from "../lib/email";
+import { resolveRecipients } from "../lib/notification-routing";
+import { getAssignedUserIds } from "./assignees";
+import {
+  isTransitionAllowed,
+  listAllowedTransitions,
+  checkPhaseGates,
+  isReversionAllowed,
+  listAllowedReversions,
+  type ChangeTrack,
+  type ChangeStatus,
+} from "../lib/state-machine";
+
+// Statuses considered "active" — i.e. work is still in flight. The list
+// excludes terminal outcomes (cancelled, completed, rejected, rolled_back).
+// Used by the GET /changes?status=active filter so the changes list shows
+// the operator's working queue by default.
+const ACTIVE_STATUSES: ChangeStatus[] = [
+  "draft",
+  "submitted",
+  "in_review",
+  "awaiting_approval",
+  "approved",
+  "in_preprod_testing",
+  "scheduled",
+  "awaiting_implementation",
+  "in_progress",
+  "implemented",
+  "in_testing",
+  "awaiting_pir",
+];
+
+const router: IRouter = Router();
+
+// Audit payloads are application snapshots, not an API contract. Only return
+// fields that are meaningful on a change (and never request/device metadata).
+const AUDIT_DETAIL_FIELDS = new Set([
+  "id", "ref", "title", "description", "track", "status", "risk", "impact", "priority", "category",
+  "ownerId", "assigneeId", "templateId", "potentialTemplateId", "parentChangeId", "cabMeetingId",
+  "plannedStart", "plannedEnd", "actualStart", "actualEnd", "hasPreprodEnv", "preprodEnvUrl",
+  "ticketLink", "requesterType", "requesterName", "closureNote", "changeId", "filename", "mimeType",
+  "size", "scope", "implementationPlan", "rollbackPlan", "riskAssessment", "impactedServices",
+  "communicationsPlan", "successCriteria", "signedOff", "testPlan", "environment", "overallResult",
+  "notes", "outcome", "objectivesMet", "issuesEncountered", "lessonsLearned", "followupActions",
+  "note", "reason",
+]);
+function safeAuditDetail(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).filter(([key]) => AUDIT_DETAIL_FIELDS.has(key)),
+  );
+}
+
+// Approver roles required per track. Per policy, Normal changes are signed off by the
+// Change Manager only after the CAB meeting; their deputy can vote in their absence
+// (handled at vote time via roleAssignmentsTable.isDeputy). Technical and business sign-off
+// is captured in the planning + CAB-meeting records, not as separate approval votes.
+// Emergency changes still require an eCAB member alongside the Change Manager.
+export const APPROVER_ROLES_BY_TRACK: Record<string, string[]> = {
+  normal: ["change_manager"],
+  // Emergency: the eCAB is the sole approving authority. The Change Manager
+  // coordinates the change but does not vote — matching common ITIL practice
+  // where the eCAB has standing authority to authorise out-of-band fixes.
+  emergency: ["ecab_member"],
+  standard: [],
+};
+
+async function expandChangeRow(c: typeof changeRequestsTable.$inferSelect) {
+  const [owner] = await db.select().from(usersTable).where(eq(usersTable.id, c.ownerId));
+  const [creator] = c.createdById != null
+    ? await db.select().from(usersTable).where(eq(usersTable.id, c.createdById))
+    : [];
+  let assigneeName: string | null = null;
+  if (c.assigneeId != null) {
+    const [a] = await db.select().from(usersTable).where(eq(usersTable.id, c.assigneeId));
+    assigneeName = a?.fullName ?? null;
+  }
+  let templateName: string | null = null;
+  if (c.templateId != null) {
+    const [t] = await db.select().from(standardTemplatesTable).where(eq(standardTemplatesTable.id, c.templateId));
+    templateName = t?.name ?? null;
+  }
+  let potentialTemplateName: string | null = null;
+  if (c.potentialTemplateId != null) {
+    const [t] = await db
+      .select()
+      .from(standardTemplatesTable)
+      .where(eq(standardTemplatesTable.id, c.potentialTemplateId));
+    potentialTemplateName = t?.name ?? null;
+  }
+  let cabMeetingDate: Date | null = null;
+  let cabMeetingStatus: string | null = null;
+  if (c.cabMeetingId != null) {
+    const [m] = await db.select().from(cabMeetingsTable).where(eq(cabMeetingsTable.id, c.cabMeetingId));
+    cabMeetingDate = m?.scheduledStart ?? null;
+    cabMeetingStatus = m?.status ?? null;
+  }
+  let parentChangeRef: string | null = null;
+  if (c.parentChangeId != null) {
+    const [parent] = await db
+      .select({ ref: changeRequestsTable.ref })
+      .from(changeRequestsTable)
+      .where(eq(changeRequestsTable.id, c.parentChangeId));
+    parentChangeRef = parent?.ref ?? null;
+  }
+  return {
+    ...c,
+    ownerName: owner?.fullName ?? "Unknown",
+    createdByName: creator?.fullName ?? owner?.fullName ?? "Unknown",
+    assigneeName,
+    templateName,
+    potentialTemplateName,
+    cabMeetingDate,
+    cabMeetingStatus,
+    parentChangeRef,
+  };
+}
+
+export async function createApprovalsForChange(changeId: number, track: string) {
+  const roleKeys = APPROVER_ROLES_BY_TRACK[track] ?? [];
+  for (const roleKey of roleKeys) {
+    await db.insert(approvalsTable).values({ changeId, roleKey, decision: "pending" });
+  }
+}
+
+// Notification routing: per-change assignees are preferred over the global
+// role pool. When no per-change assignment exists for a given role, we fall
+// back to the role_assignments table so legacy changes (no assignees yet)
+// still notify someone. Owners/implementers/testers are added to the
+// recipient list for status flips so they always know what's happening.
+async function resolveRoleTargets(changeId: number, roleKey: string) {
+  const perChange = await getAssignedUserIds(
+    changeId,
+    roleKey as "implementer" | "tester",
+  ).catch(() => [] as number[]);
+  if (perChange.length > 0) return getUserEmails(perChange);
+  const fallback = await db
+    .select({ userId: roleAssignmentsTable.userId })
+    .from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.roleKey, roleKey));
+  return getUserEmails(fallback.map((a) => a.userId));
+}
+
+async function notifyApprovers(changeId: number, change: typeof changeRequestsTable.$inferSelect) {
+  const approvals = await db.select().from(approvalsTable).where(eq(approvalsTable.changeId, changeId));
+  for (const ap of approvals) {
+    if (ap.decision !== "pending") continue;
+    const targets = await resolveRoleTargets(changeId, ap.roleKey);
+    if (targets.length === 0) continue;
+    await notify({
+      eventKey: "approval.requested",
+      to: targets,
+      subject: `[CHG ${change.ref}] Approval requested: ${change.title}`,
+      text: `Your approval is required for change ${change.ref} (${change.track}).\n\n${change.description}\n\nRisk: ${change.risk}, Impact: ${change.impact}, Priority: ${change.priority}.`,
+    });
+  }
+}
+
+// Broadcast change.completed using the admin-configurable routing rules.
+async function notifyChangeCompleted(change: typeof changeRequestsTable.$inferSelect) {
+  const targets = await resolveRecipients("change.completed", {
+    changeId: change.id,
+    ownerId: change.ownerId,
+    assigneeId: change.assigneeId,
+    track: change.track,
+  });
+  if (targets.length === 0) return;
+  await notify({
+    eventKey: "change.completed",
+    to: targets,
+    subject: `[CHG ${change.ref}] Completed: ${change.title}`,
+    text: `Change ${change.ref} (${change.track}) is now Completed.\n\n${change.description}`,
+  });
+}
+
+router.get("/changes", requireAuth, async (req, res): Promise<void> => {
+  const status = typeof req.query["status"] === "string" ? req.query["status"] : null;
+  const track = typeof req.query["track"] === "string" ? req.query["track"] : null;
+  const ownerId = req.query["ownerId"] ? Number(req.query["ownerId"]) : null;
+  const search = typeof req.query["search"] === "string" ? req.query["search"] : null;
+  // Soft-deleted changes live in the recycle bin and never appear here.
+  const conds = [isNull(changeRequestsTable.deletedAt)];
+  if (status === "active") {
+    conds.push(sql`${changeRequestsTable.status} IN (${sql.join(ACTIVE_STATUSES.map((s) => sql`${s}`), sql`, `)})`);
+  } else if (status) {
+    conds.push(eq(changeRequestsTable.status, status));
+  }
+  if (track) conds.push(eq(changeRequestsTable.track, track));
+  if (ownerId && Number.isFinite(ownerId)) conds.push(eq(changeRequestsTable.ownerId, ownerId));
+  if (search) {
+    conds.push(
+      or(
+        ilike(changeRequestsTable.title, `%${search}%`),
+        ilike(changeRequestsTable.ref, `%${search}%`),
+        ilike(changeRequestsTable.description, `%${search}%`),
+      )!,
+    );
+  }
+  const rows = await db
+    .select()
+    .from(changeRequestsTable)
+    .where(and(...conds))
+    .orderBy(desc(changeRequestsTable.createdAt));
+  const dtos = await Promise.all(rows.map(expandChangeRow));
+  res.json(dtos);
+});
+
+// User-centric work queues. Keep this separate from the general list: a row
+// can legitimately occur in several queues (for example creator and tester).
+// Soft-deleted rows are excluded and every candidate still passes the normal
+// view gate before being returned.
+router.get("/changes/my-requests", requireAuth, async (req, res): Promise<void> => {
+  const uid = req.session!.uid;
+  const rows = await db
+    .select()
+    .from(changeRequestsTable)
+    .where(isNull(changeRequestsTable.deletedAt))
+    .orderBy(desc(changeRequestsTable.updatedAt));
+  const visible: typeof rows = [];
+  for (const row of rows) {
+    if (await getChangeViewAccess(req.session!, row)) visible.push(row);
+  }
+  const ids = visible.map((r) => r.id);
+  const assignments = ids.length
+    ? await db
+        .select({ changeId: changeAssigneesTable.changeId, roleKey: changeAssigneesTable.roleKey })
+        .from(changeAssigneesTable)
+        .where(and(inArray(changeAssigneesTable.changeId, ids), eq(changeAssigneesTable.userId, uid)))
+    : [];
+  const assignmentIds = (role: "implementer" | "tester") =>
+    new Set(assignments.filter((a) => a.roleKey === role).map((a) => a.changeId));
+  const implementerIds = assignmentIds("implementer");
+  const testerIds = assignmentIds("tester");
+  const creator = visible.filter((r) => (r.createdById ?? r.ownerId) === uid);
+  const owner = visible.filter((r) => r.ownerId === uid);
+  const requester = visible.filter((r) => r.requesterUserId === uid);
+  const expand = async (list: typeof visible) => Promise.all(list.map(expandChangeRow));
+  res.json({
+    creator: await expand(creator),
+    owner: await expand(owner),
+    implementer: await expand(visible.filter((r) => implementerIds.has(r.id))),
+    tester: await expand(visible.filter((r) => testerIds.has(r.id))),
+    requester: await expand(requester),
+  });
+});
+
+router.post("/changes", requireAuth, async (req, res): Promise<void> => {
+  const session = req.session!;
+  const b = req.body ?? {};
+  if (!b.title || !b.description || !b.track || !b.risk || !b.impact || !b.priority || !b.category) {
+    res.status(400).json({ error: "Missing required fields" });
+    return;
+  }
+  // Enforce category from the managed lookup table — anything outside the
+  // active categories list is rejected so we never store free-text labels.
+  {
+    const { changeCategoriesTable } = await import("@workspace/db");
+    const [cat] = await db
+      .select()
+      .from(changeCategoriesTable)
+      .where(eq(changeCategoriesTable.key, b.category));
+    if (!cat || !cat.isActive) {
+      res.status(400).json({ error: "Unknown or inactive category." });
+      return;
+    }
+  }
+  // Standard-track classification: only allowed when an active, existing template is
+  // referenced. Submissions that claim 'standard' without a valid + active template are
+  // rejected with HTTP 400 so callers cannot smuggle changes around the approval
+  // pipeline by claiming a non-existent or disabled template.
+  let track = b.track;
+  let templateId: number | null = null;
+  let initialStatus = "draft";
+  let bypassCab = false;
+  let autoApprove = false;
+  if (track === "standard") {
+    if (!b.templateId) {
+      res.status(400).json({ error: "Standard changes require a templateId." });
+      return;
+    }
+    const [t] = await db.select().from(standardTemplatesTable).where(eq(standardTemplatesTable.id, b.templateId));
+    if (!t || !t.isActive) {
+      res.status(400).json({ error: "Selected template is unknown or inactive." });
+      return;
+    }
+    templateId = t.id;
+    bypassCab = t.bypassCab;
+    autoApprove = t.autoApprove;
+    if (autoApprove) initialStatus = "approved";
+    if (bypassCab) initialStatus = autoApprove ? "scheduled" : "awaiting_implementation";
+  }
+  // "Potential Standard Change": a NORMAL change may be linked to a DISABLED
+  // template that is being trialled for promotion to a real standard change.
+  // Active templates are rejected here — those belong to the standard track.
+  let potentialTemplateId: number | null = null;
+  if (b.potentialTemplateId != null) {
+    if (track !== "normal") {
+      res.status(400).json({ error: "Potential Standard Change is only available on normal changes." });
+      return;
+    }
+    const [pt] = await db
+      .select()
+      .from(standardTemplatesTable)
+      .where(eq(standardTemplatesTable.id, Number(b.potentialTemplateId)));
+    if (!pt || pt.isActive) {
+      res.status(400).json({ error: "Potential standard template is unknown or already enabled." });
+      return;
+    }
+    potentialTemplateId = pt.id;
+  }
+  const ref = await nextRef(track);
+  let requesterUserId: number | null = null;
+  if (b.requesterType === "internal" && typeof b.requesterUserId === "number" && Number.isFinite(b.requesterUserId)) {
+    const [requester] = await db.select({ id: usersTable.id }).from(usersTable).where(eq(usersTable.id, b.requesterUserId));
+    if (!requester) {
+      res.status(400).json({ error: "Unknown internal requester." });
+      return;
+    }
+    requesterUserId = requester.id;
+  }
+  const [created] = await db
+    .insert(changeRequestsTable)
+    .values({
+      ref,
+      title: b.title,
+      description: b.description,
+      track,
+      status: initialStatus,
+      risk: b.risk,
+      impact: b.impact,
+      priority: b.priority,
+      category: b.category,
+      ownerId: typeof b.ownerId === "number" && Number.isFinite(b.ownerId) ? b.ownerId : session.uid,
+      assigneeId: b.assigneeId ?? null,
+      templateId,
+      potentialTemplateId,
+      hasPreprodEnv: !!b.hasPreprodEnv,
+      preprodEnvUrl: typeof b.preprodEnvUrl === "string" ? b.preprodEnvUrl : null,
+      ticketLink: typeof b.ticketLink === "string" && b.ticketLink.trim() ? b.ticketLink.trim() : null,
+      requesterType: b.requesterType === "internal" || b.requesterType === "external" ? b.requesterType : null,
+      requesterName: typeof b.requesterName === "string" && b.requesterName.trim() ? b.requesterName.trim() : null,
+      requesterUserId,
+      createdById: session.uid,
+      plannedStart: b.plannedStart ? new Date(b.plannedStart) : null,
+      plannedEnd: b.plannedEnd ? new Date(b.plannedEnd) : null,
+    })
+    .returning();
+  // Always create a planning record, pre-filled from either the active
+  // standard template or the disabled potential-standard template.
+  const planningTemplateId = templateId ?? potentialTemplateId;
+  const [planningTemplate] = planningTemplateId
+    ? await db.select().from(standardTemplatesTable).where(eq(standardTemplatesTable.id, planningTemplateId))
+    : [];
+  await db
+    .insert(planningRecordsTable)
+    .values({
+      changeId: created.id,
+      scope: planningTemplate?.prefilledScope ?? "",
+      implementationPlan: planningTemplate?.prefilledPlanning ?? "",
+      rollbackPlan: planningTemplate?.prefilledRollbackPlan ?? "",
+      riskAssessment: planningTemplate?.prefilledRiskAssessment ?? "",
+      impactedServices: planningTemplate?.prefilledImpactedServices ?? "",
+      communicationsPlan: planningTemplate?.prefilledCommunicationsPlan ?? "",
+      successCriteria: planningTemplate?.prefilledSuccessCriteria ?? "",
+    })
+    .onConflictDoNothing();
+  // Pre-fill planning from template + bump the template's usage counter so admins can
+  // see which templates are most relied on.
+  if (templateId) {
+    const t = planningTemplate;
+    await db
+      .update(standardTemplatesTable)
+      .set({ usageCount: sql`${standardTemplatesTable.usageCount} + 1` })
+      .where(eq(standardTemplatesTable.id, templateId));
+    if (t?.prefilledTestPlan) {
+      await db
+        .insert(testRecordsTable)
+        .values({ changeId: created.id, testPlan: t.prefilledTestPlan })
+        .onConflictDoNothing();
+    }
+  }
+  if (track !== "standard") {
+    await createApprovalsForChange(created.id, track);
+  }
+  await audit(req, {
+    action: "change.created",
+    entityType: "change",
+    entityId: created.id,
+    summary: `Created ${b.track} change ${ref}: ${b.title}`,
+    after: created,
+  });
+  if (initialStatus === "draft" && b.track !== "standard") {
+    await notifyApprovers(created.id, created);
+  }
+  res.status(201).json(await expandChangeRow(created));
+});
+
+router.get("/changes/:id", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [row] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  // Soft-deleted changes are only reachable through the admin recycle bin.
+  if (!row || row.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  if (!(await getChangeViewAccess(req.session!, row))) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+  const dto = await expandChangeRow(row);
+  // Promotion progress for the header highlight: completed trial runs vs the
+  // global threshold at which the linked disabled template becomes a
+  // candidate for being enabled as a standard template.
+  let standardPromotion: { completedCount: number; threshold: number; ready: boolean } | null = null;
+  if (row.potentialTemplateId != null) {
+    standardPromotion = await getPromotionStatus(row.potentialTemplateId);
+  }
+  const [planning] = await db.select().from(planningRecordsTable).where(eq(planningRecordsTable.changeId, id));
+  const [testing] = await db
+    .select()
+    .from(testRecordsTable)
+    .where(and(eq(testRecordsTable.changeId, id), eq(testRecordsTable.kind, "production")));
+  const [pir] = await db.select().from(pirRecordsTable).where(eq(pirRecordsTable.changeId, id));
+  const approvals = await db
+    .select({
+      id: approvalsTable.id,
+      changeId: approvalsTable.changeId,
+      roleKey: approvalsTable.roleKey,
+      approverId: approvalsTable.approverId,
+      decision: approvalsTable.decision,
+      comment: approvalsTable.comment,
+      decidedAt: approvalsTable.decidedAt,
+      viaDeputy: approvalsTable.viaDeputy,
+      roleName: rolesTable.name,
+      approverName: usersTable.fullName,
+    })
+    .from(approvalsTable)
+    .leftJoin(rolesTable, eq(rolesTable.key, approvalsTable.roleKey))
+    .leftJoin(usersTable, eq(usersTable.id, approvalsTable.approverId))
+    .where(eq(approvalsTable.changeId, id));
+  const comments = await db
+    .select({
+      id: commentsTable.id,
+      changeId: commentsTable.changeId,
+      authorId: commentsTable.authorId,
+      body: commentsTable.body,
+      createdAt: commentsTable.createdAt,
+      authorName: usersTable.fullName,
+    })
+    .from(commentsTable)
+    .leftJoin(usersTable, eq(usersTable.id, commentsTable.authorId))
+    .where(eq(commentsTable.changeId, id))
+    .orderBy(desc(commentsTable.createdAt));
+  // Most recent track switch (if any) — surfaced as a note on the detail page
+  // since the ref keeps its original prefix after a switch.
+  const [trackAudit] = await db
+    .select()
+    .from(auditLogTable)
+    .where(
+      and(
+        eq(auditLogTable.action, "change.track_changed"),
+        eq(auditLogTable.entityType, "change"),
+        eq(auditLogTable.entityId, id),
+      ),
+    )
+    .orderBy(desc(auditLogTable.timestamp))
+    .limit(1);
+  const trackChange = trackAudit
+    ? {
+        from: (trackAudit.before as { track?: string } | null)?.track ?? null,
+        to: (trackAudit.after as { track?: string } | null)?.track ?? null,
+        at: trackAudit.timestamp,
+        by: trackAudit.actorName,
+      }
+    : null;
+  res.json({
+    ...dto,
+    standardPromotion,
+    trackChange,
+    planning: planning ?? { changeId: id, scope: "", implementationPlan: "", rollbackPlan: "", riskAssessment: "", impactedServices: "", communicationsPlan: "", toInformSpoc: false, procedure: "", successCriteria: "", signedOff: false },
+    testing: testing ?? { changeId: id, testPlan: "", environment: "", overallResult: "pending", notes: "", cases: [] },
+    pir: pir ?? { changeId: id, outcome: "successful", objectivesMet: "", issuesEncountered: "", lessonsLearned: "", followupActions: "" },
+    approvals: approvals.map((a) => ({
+      ...a,
+      roleName: a.roleName ?? a.roleKey,
+      approverName: a.approverName ?? null,
+    })),
+    comments: comments.map((c) => ({ ...c, authorName: c.authorName ?? "Unknown" })),
+  });
+});
+
+// Change-scoped audit history. Audit rows for other entities are deliberately
+// not inferred from IDs: IDs overlap across tables and could leak unrelated
+// activity. Change-related child operations include the change as entity ID.
+router.get("/changes/:id/history", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [change] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!change || change.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  if (!(await getChangeViewAccess(req.session!, change))) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+  const rows = await db
+    .select()
+    .from(auditLogTable)
+    .where(or(
+      and(eq(auditLogTable.entityType, "change"), eq(auditLogTable.entityId, id)),
+      sql`${auditLogTable.before} @> ${JSON.stringify({ changeId: id })}::jsonb`,
+      sql`${auditLogTable.after} @> ${JSON.stringify({ changeId: id })}::jsonb`,
+    ))
+    .orderBy(desc(auditLogTable.timestamp));
+  res.json(rows.map((row) => ({
+    id: row.id,
+    timestamp: row.timestamp,
+    actorName: row.actorName,
+    action: row.action,
+    summary: row.summary,
+    before: safeAuditDetail(row.before),
+    after: safeAuditDetail(row.after),
+  })));
+});
+
+// Create a new independent RFC from a failed one. Evidence and governance
+// records (attachments, approvals and audit) never cross the boundary.
+router.post("/changes/:id/rechange", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [original] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!original || original.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  if (!(await getChangeViewAccess(req.session!, original))) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+  if (!(await getChangeAccess(req.session!, original))) {
+    res.status(403).json({ error: "Only the owner, assignee, change manager, or an admin can create a re-change." });
+    return;
+  }
+  const [pir] = await db.select().from(pirRecordsTable).where(eq(pirRecordsTable.changeId, id));
+  const failedStatus = ["rejected", "cancelled", "rolled_back"].includes(original.status);
+  const failedPir = original.status === "completed" && !!pir && ["failed", "rolled_back"].includes(pir.outcome);
+  if (!failedStatus && !failedPir) {
+    res.status(400).json({ error: "A re-change can only be created from a rejected, cancelled, rolled back, or unsuccessfully completed change." });
+    return;
+  }
+  // Match normal creation semantics: a Standard re-change may not retain a
+  // template that has since been withdrawn or deleted.
+  if (original.track === "standard") {
+    const [template] = original.templateId == null
+      ? []
+      : await db.select().from(standardTemplatesTable).where(eq(standardTemplatesTable.id, original.templateId));
+    if (!template || !template.isActive) {
+      res.status(409).json({
+        error: "The original standard template is missing or inactive. A re-change cannot be created as Standard until an active template is selected.",
+      });
+      return;
+    }
+  }
+  const ref = await nextRef(original.track);
+  const [created] = await db.insert(changeRequestsTable).values({
+    ref,
+    title: original.title,
+    description: original.description,
+    track: original.track,
+    status: "draft",
+    risk: original.risk,
+    impact: original.impact,
+    priority: original.priority,
+    category: original.category,
+    ownerId: req.session!.uid,
+    assigneeId: original.assigneeId,
+    templateId: original.templateId,
+    potentialTemplateId: original.potentialTemplateId,
+    parentChangeId: original.id,
+    hasPreprodEnv: original.hasPreprodEnv,
+    preprodEnvUrl: original.preprodEnvUrl,
+    ticketLink: original.ticketLink,
+    requesterType: original.requesterType,
+    requesterName: original.requesterName,
+    requesterUserId: original.requesterUserId,
+    createdById: req.session!.uid,
+    plannedStart: original.plannedStart,
+    plannedEnd: original.plannedEnd,
+  }).returning();
+  const [planning] = await db.select().from(planningRecordsTable).where(eq(planningRecordsTable.changeId, id));
+  await db.insert(planningRecordsTable).values({
+    changeId: created.id,
+    scope: planning?.scope ?? "",
+    implementationPlan: planning?.implementationPlan ?? "",
+    rollbackPlan: planning?.rollbackPlan ?? "",
+    riskAssessment: planning?.riskAssessment ?? "",
+    impactedServices: planning?.impactedServices ?? "",
+    communicationsPlan: planning?.communicationsPlan ?? "",
+    toInformSpoc: planning?.toInformSpoc ?? false,
+    procedure: planning?.procedure ?? "",
+    successCriteria: planning?.successCriteria ?? "",
+    signedOff: false,
+    signedOffAt: null,
+    signedOffBy: null,
+  }).onConflictDoNothing();
+  if (created.track !== "standard") await createApprovalsForChange(created.id, created.track);
+  await audit(req, {
+    action: "change.recreated",
+    entityType: "change",
+    entityId: created.id,
+    summary: `Created re-change ${created.ref} from ${original.ref}`,
+    after: { id: created.id, parentChangeId: original.id },
+  });
+  res.status(201).json(await expandChangeRow(created));
+});
+
+// Changes whose planned windows intersect this change's planned window.
+// Open-ended windows are treated as a point at plannedStart.
+router.get("/changes/:id/overlaps", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [current] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!current || current.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  if (!(await getChangeViewAccess(req.session!, current))) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+  if (!current.plannedStart) {
+    res.json([]);
+    return;
+  }
+  const start = current.plannedStart <= (current.plannedEnd ?? current.plannedStart)
+    ? current.plannedStart
+    : current.plannedEnd!;
+  const end = current.plannedStart <= (current.plannedEnd ?? current.plannedStart)
+    ? (current.plannedEnd ?? current.plannedStart)
+    : current.plannedStart;
+  const rows = await db
+    .select()
+    .from(changeRequestsTable)
+    .where(and(
+      isNull(changeRequestsTable.deletedAt),
+      sql`${changeRequestsTable.id} <> ${id}`,
+      isNotNull(changeRequestsTable.plannedStart),
+      sql`LEAST(${changeRequestsTable.plannedStart}, COALESCE(${changeRequestsTable.plannedEnd}, ${changeRequestsTable.plannedStart})) <= ${end}`,
+      sql`GREATEST(${changeRequestsTable.plannedStart}, COALESCE(${changeRequestsTable.plannedEnd}, ${changeRequestsTable.plannedStart})) >= ${start}`,
+    ))
+    .orderBy(changeRequestsTable.plannedStart);
+  res.json(await Promise.all(rows.map(expandChangeRow)));
+});
+
+router.patch("/changes/:id", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [before] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!before || before.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  const access = await getChangeAccess(req.session!, before);
+  const b = req.body ?? {};
+  const updates: Partial<typeof changeRequestsTable.$inferInsert> = {};
+  for (const k of ["title", "description", "risk", "impact", "priority", "category", "preprodEnvUrl"] as const) {
+    if (typeof b[k] === "string") (updates as Record<string, unknown>)[k] = b[k];
+  }
+  if (b.ticketLink === null) updates.ticketLink = null;
+  else if (typeof b.ticketLink === "string") updates.ticketLink = b.ticketLink.trim() || null;
+  if (b.requesterType === null) updates.requesterType = null;
+  else if (b.requesterType === "internal" || b.requesterType === "external") {
+    updates.requesterType = b.requesterType;
+    if (b.requesterType === "external") updates.requesterUserId = null;
+  }
+  if (b.requesterName === null) updates.requesterName = null;
+  else if (typeof b.requesterName === "string") updates.requesterName = b.requesterName.trim() || null;
+  if (b.requesterUserId === null) updates.requesterUserId = null;
+  else if (typeof b.requesterUserId === "number" && Number.isFinite(b.requesterUserId)) {
+    const [requester] = await db.select({ id: usersTable.id }).from(usersTable).where(eq(usersTable.id, b.requesterUserId));
+    if (!requester) {
+      res.status(400).json({ error: "Unknown internal requester." });
+      return;
+    }
+    updates.requesterUserId = requester.id;
+  }
+  if (typeof b.hasPreprodEnv === "boolean") updates.hasPreprodEnv = b.hasPreprodEnv;
+  if (b.assigneeId === null) updates.assigneeId = null;
+  else if (typeof b.assigneeId === "number") updates.assigneeId = b.assigneeId;
+  if (typeof b.ownerId === "number" && Number.isFinite(b.ownerId)) {
+    const [owner] = await db.select({ id: usersTable.id }).from(usersTable).where(eq(usersTable.id, b.ownerId));
+    if (!owner) {
+      res.status(400).json({ error: "Unknown change owner." });
+      return;
+    }
+    updates.ownerId = owner.id;
+  }
+  // "Potential Standard Change" link — editable after creation as well.
+  let potentialLinkedTemplate: typeof standardTemplatesTable.$inferSelect | undefined;
+  if (b.potentialTemplateId === null) updates.potentialTemplateId = null;
+  else if (typeof b.potentialTemplateId === "number") {
+    if (before.track !== "normal") {
+      res.status(400).json({ error: "Potential Standard Change is only available on normal changes." });
+      return;
+    }
+    const [pt] = await db
+      .select()
+      .from(standardTemplatesTable)
+      .where(eq(standardTemplatesTable.id, b.potentialTemplateId));
+    if (!pt || pt.isActive) {
+      res.status(400).json({ error: "Potential standard template is unknown or already enabled." });
+      return;
+    }
+    updates.potentialTemplateId = pt.id;
+    if (before.potentialTemplateId !== pt.id) potentialLinkedTemplate = pt;
+  }
+  if (b.cabMeetingId === null) updates.cabMeetingId = null;
+  else if (typeof b.cabMeetingId === "number") updates.cabMeetingId = b.cabMeetingId;
+  if (b.plannedStart) updates.plannedStart = new Date(b.plannedStart);
+  if (b.plannedStart === null) updates.plannedStart = null;
+  if (b.plannedEnd) updates.plannedEnd = new Date(b.plannedEnd);
+  if (b.plannedEnd === null) updates.plannedEnd = null;
+
+  // Template selection for standard changes still in draft (e.g. drafts
+  // created from ServiceDesk Plus without a template). Only active templates
+  // may be linked; prefills are applied like at creation time. The template
+  // cannot be changed after the change has left draft.
+  let linkedTemplate: typeof standardTemplatesTable.$inferSelect | undefined;
+  if (typeof b.templateId === "number") {
+    if (before.track !== "standard" || before.status !== "draft") {
+      res.status(400).json({ error: "A template can only be set on a standard change while it is in draft." });
+      return;
+    }
+    const [t] = await db.select().from(standardTemplatesTable).where(eq(standardTemplatesTable.id, b.templateId));
+    if (!t || !t.isActive) {
+      res.status(400).json({ error: "Selected template is unknown or inactive." });
+      return;
+    }
+    if (before.templateId !== t.id) {
+      updates.templateId = t.id;
+      linkedTemplate = t;
+    }
+  }
+
+  // Write gate. The "Change Owner" field (ownerId) may be changed by ANY
+  // authenticated user — explicit user requirement: anyone can hand a change
+  // over (e.g. take it over themselves) so the new owner can act on it; the
+  // audit log records who did it. All other fields keep the usual gate, so a
+  // role-less caller is rejected unless every non-ownerId update is a
+  // no-op (the details form always PATCHes the full field set).
+  if (!access) {
+    const isNoop = (key: keyof typeof updates): boolean => {
+      const nv = updates[key];
+      const ov = (before as Record<string, unknown>)[key as string];
+      if (nv instanceof Date || ov instanceof Date) {
+        const nt = nv instanceof Date ? nv.getTime() : nv === null ? null : NaN;
+        const ot = ov instanceof Date ? ov.getTime() : ov === null ? null : NaN;
+        return nt === ot;
+      }
+      return nv === (ov ?? null) || (nv === "" && (ov === "" || ov === null));
+    };
+    const blocked = (Object.keys(updates) as (keyof typeof updates)[]).filter(
+       (k) => k !== "ownerId" && !isNoop(k),
+    );
+    if (blocked.length > 0) {
+      res.status(403).json({
+        error: "You can only change the Change Owner on this change. Other fields require the owner, assignee, change manager, or an admin.",
+      });
+      return;
+    }
+    for (const k of Object.keys(updates)) {
+      if (k !== "assigneeId") delete (updates as Record<string, unknown>)[k];
+    }
+  }
+
+  const [updated] = await db
+    .update(changeRequestsTable)
+    .set(updates)
+    .where(eq(changeRequestsTable.id, id))
+    .returning();
+  if (linkedTemplate) {
+    await db
+      .update(standardTemplatesTable)
+      .set({ usageCount: sql`${standardTemplatesTable.usageCount} + 1` })
+      .where(eq(standardTemplatesTable.id, linkedTemplate.id));
+    if (linkedTemplate.prefilledTestPlan) {
+      await db
+        .insert(testRecordsTable)
+        .values({ changeId: id, testPlan: linkedTemplate.prefilledTestPlan })
+        .onConflictDoNothing();
+    }
+  }
+  const prefillTemplate = linkedTemplate ?? potentialLinkedTemplate;
+  if (prefillTemplate) {
+    const [p] = await db.select().from(planningRecordsTable).where(eq(planningRecordsTable.changeId, id));
+    const planningPrefill = {
+      scope: p?.scope ? p.scope : (prefillTemplate.prefilledScope ?? ""),
+      implementationPlan: p?.implementationPlan ? p.implementationPlan : (prefillTemplate.prefilledPlanning ?? ""),
+      rollbackPlan: p?.rollbackPlan ? p.rollbackPlan : (prefillTemplate.prefilledRollbackPlan ?? ""),
+      riskAssessment: p?.riskAssessment ? p.riskAssessment : (prefillTemplate.prefilledRiskAssessment ?? ""),
+      impactedServices: p?.impactedServices ? p.impactedServices : (prefillTemplate.prefilledImpactedServices ?? ""),
+      communicationsPlan: p?.communicationsPlan ? p.communicationsPlan : (prefillTemplate.prefilledCommunicationsPlan ?? ""),
+      successCriteria: p?.successCriteria ? p.successCriteria : (prefillTemplate.prefilledSuccessCriteria ?? ""),
+    };
+    await db
+      .insert(planningRecordsTable)
+      .values({ changeId: id, ...planningPrefill })
+      .onConflictDoUpdate({ target: planningRecordsTable.changeId, set: planningPrefill });
+  }
+  await audit(req, {
+    action: "change.updated",
+    entityType: "change",
+    entityId: id,
+    summary: `Updated change ${before.ref}`,
+    before,
+    after: updated,
+  });
+  res.json(await expandChangeRow(updated));
+});
+
+// GET /changes/:id/ecab-teams-url — server-built Teams "new meeting" deep link
+// with all active eCAB members (primaries + deputies) as attendees. Built here
+// because the non-admin /users listing deliberately omits email addresses, so
+// the frontend cannot assemble the attendee list itself — previously only
+// admins got a link with invitees.
+router.get("/changes/:id/ecab-teams-url", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [c] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!c || c.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  if (c.track !== "emergency") {
+    res.status(400).json({ error: "eCAB Teams meetings only apply to emergency changes." });
+    return;
+  }
+  const members = await db
+    .select({ email: usersTable.email, isActive: usersTable.isActive })
+    .from(roleAssignmentsTable)
+    .innerJoin(usersTable, eq(usersTable.id, roleAssignmentsTable.userId))
+    .where(eq(roleAssignmentsTable.roleKey, "ecab_member"));
+  const emails = [
+    ...new Set(
+      members
+        .filter((m) => m.isActive && typeof m.email === "string" && m.email.length > 0)
+        .map((m) => m.email as string),
+    ),
+  ];
+  const subject = encodeURIComponent(`eCAB URGENT — ${c.ref} ${c.title}`);
+  const attendees = encodeURIComponent(emails.join(","));
+  const url = `https://teams.microsoft.com/l/meeting/new?subject=${subject}${attendees ? `&attendees=${attendees}` : ""}`;
+  res.json({ url, attendeeCount: emails.length });
+});
+
+// POST /changes/:id/track — switch a change between tracks (normal / standard /
+// emergency). Admin or Change Manager only. Governance reset by design:
+//   * status goes back to draft (the old status may not exist in the new track)
+//   * all approval rows are cleared and re-seeded for the new track
+//   * template link is detached when leaving the standard track
+//   * any CAB docket entries are removed (a draft has no business on an agenda)
+//   * the ref keeps its original prefix — it is a permanent identifier; the
+//     detail page surfaces the switch via the audit log instead.
+// Only allowed from draft or submitted: later in the lifecycle the collected
+// approvals/testing evidence would be governed by the wrong track's rules.
+router.post("/changes/:id/track", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const session = req.session!;
+  const userRoles = session.isAdmin ? [] : await loadUserRoles(session.uid);
+  if (!session.isAdmin && !userRoles.includes("change_manager")) {
+    res.status(403).json({ error: "Only an admin or the Change Manager can switch a change's track." });
+    return;
+  }
+  const [before] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!before || before.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  const newTrack = req.body?.track as ChangeTrack | undefined;
+  if (newTrack !== "normal" && newTrack !== "standard" && newTrack !== "emergency") {
+    res.status(400).json({ error: "track must be one of: normal, standard, emergency." });
+    return;
+  }
+  if (newTrack === before.track) {
+    res.status(400).json({ error: `Change is already on the ${newTrack} track.` });
+    return;
+  }
+  if (before.status !== "draft" && before.status !== "submitted") {
+    res.status(409).json({
+      error: "The track can only be switched while the change is in Draft or Submitted.",
+    });
+    return;
+  }
+
+  const updates: Partial<typeof changeRequestsTable.$inferInsert> = {
+    track: newTrack,
+    status: "draft",
+    updatedAt: new Date(),
+  };
+  // Leaving the standard track: the template no longer applies.
+  if (before.track === "standard") updates.templateId = null;
+  // Leaving the normal track: the "Potential Standard Change" link only makes
+  // sense for normal changes — clear it so the change can never count toward
+  // template promotion from another track.
+  if (before.track === "normal" && newTrack !== "normal") updates.potentialTemplateId = null;
+  // A draft has no business sitting on a CAB agenda.
+  updates.cabMeetingId = null;
+
+  // Transactional + guarded: the UPDATE itself re-checks status/deletedAt so a
+  // concurrent transition (or delete) between our read and this write cannot
+  // slip a track switch past the draft/submitted rule; approvals are cleared
+  // and re-seeded in the same transaction so they always match the new track.
+  const updated = await db.transaction(async (tx) => {
+    const [row] = await tx
+      .update(changeRequestsTable)
+      .set(updates)
+      .where(
+        and(
+          eq(changeRequestsTable.id, id),
+          inArray(changeRequestsTable.status, ["draft", "submitted"]),
+          isNull(changeRequestsTable.deletedAt),
+        ),
+      )
+      .returning();
+    if (!row) return null;
+    await tx.delete(cabChangesTable).where(eq(cabChangesTable.changeId, id));
+    // Approvals are governance artifacts of the old track — clear and re-seed.
+    await tx.delete(approvalsTable).where(eq(approvalsTable.changeId, id));
+    for (const roleKey of APPROVER_ROLES_BY_TRACK[newTrack] ?? []) {
+      await tx.insert(approvalsTable).values({ changeId: id, roleKey, decision: "pending" });
+    }
+    return row;
+  });
+  if (!updated) {
+    res.status(409).json({ error: "The change moved out of Draft/Submitted — track not switched." });
+    return;
+  }
+
+  await audit(req, {
+    action: "change.track_changed",
+    entityType: "change",
+    entityId: id,
+    summary: `Track changed from ${before.track} to ${newTrack} on ${before.ref}; status reset to draft, approvals cleared`,
+    before,
+    after: updated,
+  });
+  res.json(await expandChangeRow(updated));
+});
+
+// ---------------------------------------------------------------------------
+// RECYCLE BIN — admin-only soft delete, restore, and permanent purge.
+//
+// DELETE /changes/:id           → move a change into the recycle bin (soft delete)
+// GET    /recycle-bin/changes   → list soft-deleted changes
+// POST   /changes/:id/restore   → restore a change from the recycle bin
+// DELETE /recycle-bin/changes   → empty the bin (irreversible hard delete of
+//                                 the changes AND all their dependent records)
+// ---------------------------------------------------------------------------
+
+router.delete("/changes/:id", requireAdmin, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [before] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!before || before.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  const [updated] = await db
+    .update(changeRequestsTable)
+    .set({ deletedAt: new Date(), deletedById: req.session!.uid })
+    .where(eq(changeRequestsTable.id, id))
+    .returning();
+  await audit(req, {
+    action: "change.deleted",
+    entityType: "change",
+    entityId: id,
+    summary: `Moved change ${before.ref} to the recycle bin`,
+    before,
+    after: { deletedAt: updated?.deletedAt ?? null },
+  });
+  res.status(204).end();
+});
+
+router.get("/recycle-bin/changes", requireAdmin, async (_req, res): Promise<void> => {
+  const rows = await db
+    .select()
+    .from(changeRequestsTable)
+    .where(isNotNull(changeRequestsTable.deletedAt))
+    .orderBy(desc(changeRequestsTable.deletedAt));
+  const dtos = await Promise.all(
+    rows.map(async (c) => {
+      const dto = await expandChangeRow(c);
+      let deletedByName: string | null = null;
+      if (c.deletedById != null) {
+        const [u] = await db.select().from(usersTable).where(eq(usersTable.id, c.deletedById));
+        deletedByName = u?.fullName ?? null;
+      }
+      return { ...dto, deletedByName };
+    }),
+  );
+  res.json(dtos);
+});
+
+router.post("/changes/:id/restore", requireAdmin, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const [before] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!before) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  if (!before.deletedAt) {
+    res.status(400).json({ error: "This change is not in the recycle bin." });
+    return;
+  }
+  // Conditional update guards against a concurrent "empty bin" purge: if the
+  // row was already hard-deleted (or restored) in the meantime, nothing matches.
+  const [restored] = await db
+    .update(changeRequestsTable)
+    .set({ deletedAt: null, deletedById: null })
+    .where(and(eq(changeRequestsTable.id, id), isNotNull(changeRequestsTable.deletedAt)))
+    .returning();
+  if (!restored) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  await audit(req, {
+    action: "change.restored",
+    entityType: "change",
+    entityId: id,
+    summary: `Restored change ${before.ref} from the recycle bin`,
+    before: { deletedAt: before.deletedAt },
+    after: restored,
+  });
+  res.json(await expandChangeRow(restored));
+});
+
+router.delete("/recycle-bin/changes", requireAdmin, async (req, res): Promise<void> => {
+  const deleted = await db
+    .select()
+    .from(changeRequestsTable)
+    .where(isNotNull(changeRequestsTable.deletedAt));
+  if (deleted.length === 0) {
+    res.json({ purged: 0 });
+    return;
+  }
+  const ids = deleted.map((c) => c.id);
+  // Hard delete: remove every dependent record so no orphan rows remain. The
+  // audit log is intentionally untouched (append-only trail of what happened).
+  await db.delete(approvalsTable).where(inArray(approvalsTable.changeId, ids));
+  await db.delete(commentsTable).where(inArray(commentsTable.changeId, ids));
+  await db.delete(discussionReadsTable).where(inArray(discussionReadsTable.changeId, ids));
+  await db.delete(changeAssigneesTable).where(inArray(changeAssigneesTable.changeId, ids));
+  await db.delete(attachmentsTable).where(inArray(attachmentsTable.changeId, ids));
+  await db.delete(planningRecordsTable).where(inArray(planningRecordsTable.changeId, ids));
+  await db.delete(testRecordsTable).where(inArray(testRecordsTable.changeId, ids));
+  await db.delete(pirRecordsTable).where(inArray(pirRecordsTable.changeId, ids));
+  await db.delete(cabChangesTable).where(inArray(cabChangesTable.changeId, ids));
+  // Only rows still marked deleted are purged, so a change restored between
+  // the snapshot above and this statement survives.
+  await db
+    .delete(changeRequestsTable)
+    .where(and(inArray(changeRequestsTable.id, ids), isNotNull(changeRequestsTable.deletedAt)));
+  await audit(req, {
+    action: "recycle_bin.emptied",
+    entityType: "change",
+    entityId: 0,
+    summary: `Emptied the recycle bin: permanently deleted ${ids.length} change(s) (${deleted.map((c) => c.ref).join(", ")})`,
+    before: deleted.map((c) => ({ id: c.id, ref: c.ref, title: c.title })),
+  });
+  res.json({ purged: ids.length });
+});
+
+router.post("/changes/:id/transition", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const { toStatus, note } = req.body ?? {};
+  if (typeof toStatus !== "string") {
+    res.status(400).json({ error: "toStatus is required" });
+    return;
+  }
+  // Cancelling or rejecting requires an explanatory note (>= 5 chars). It is
+  // stored on the change, shown on the detail page, and written back into
+  // the SD+ resolution field for changes that originated from an SD+ ticket.
+  const trimmedNote = typeof note === "string" ? note.trim() : "";
+  if ((toStatus === "cancelled" || toStatus === "rejected") && trimmedNote.length < 5) {
+    res.status(400).json({
+      error:
+        toStatus === "cancelled"
+          ? "A cancellation reason (at least 5 characters) is required."
+          : "A rejection reason (at least 5 characters) is required.",
+    });
+    return;
+  }
+  const [before] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!before || before.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  // Authorization
+  const access = await getChangeAccess(req.session!, before);
+  if (!access) {
+    res.status(403).json({ error: "Only the owner, assignee, change manager, or an admin can transition this change." });
+    return;
+  }
+  // A docketed change is governed by its CAB until that meeting is cancelled.
+  // Check cab_changes rather than only the denormalized change column so
+  // legacy and multi-meeting docket rows receive the same protection.
+  if (toStatus === "cancelled" || toStatus === "rejected") {
+    const [activeDocket] = await db
+      .select({ meetingId: cabMeetingsTable.id })
+      .from(cabChangesTable)
+      .innerJoin(cabMeetingsTable, eq(cabMeetingsTable.id, cabChangesTable.meetingId))
+      .where(and(eq(cabChangesTable.changeId, id), sql`${cabMeetingsTable.status} <> 'cancelled'`))
+      .limit(1);
+    if (activeDocket) {
+      res.status(400).json({
+        error: "This change is planned on a non-cancelled CAB meeting and cannot be rejected or cancelled from the change view. Remove it from the CAB agenda or cancel the CAB first.",
+      });
+      return;
+    }
+  }
+  // Per-track state machine
+  const track = before.track as ChangeTrack;
+  const fromStatus = before.status as ChangeStatus;
+  const targetStatus = toStatus as ChangeStatus;
+  if (!isTransitionAllowed(track, fromStatus, targetStatus)) {
+    res.status(400).json({
+      error: `Transition ${fromStatus} → ${targetStatus} is not allowed for ${track} changes.`,
+      allowed: listAllowedTransitions(track, fromStatus),
+    });
+    return;
+  }
+  // Standard changes created without a template (e.g. via the SD+ webhook)
+  // must have one linked before leaving draft — templates are what authorise
+  // the standard track to skip the approval pipeline.
+  if (track === "standard" && fromStatus === "draft" && targetStatus !== "cancelled" && !before.templateId) {
+    res.status(400).json({
+      error: "A standard template must be selected before this change can leave draft. Pick one in the Details tab.",
+    });
+    return;
+  }
+  // Governance gate: only an admin or governance role holder
+  // (change_manager / eCAB / CAB chair) may put a change into
+  // `awaiting_approval` — owners/assignees should not self-flip into the
+  // approval state. The CAB-meeting-in-progress requirement is enforced
+  // per-vote in /api/approvals (so a change can wait in `awaiting_approval`
+  // until its docketed meeting actually starts, which is when votes are cast).
+  if (targetStatus === "awaiting_approval" && (track === "normal" || track === "emergency")) {
+    if (!isPrivilegedAccess(access)) {
+      res
+        .status(403)
+        .json({ error: "Only an admin or governance role holder can move a change into approval." });
+      return;
+    }
+  }
+  // Phase gates (planning sign-off, testing passed, PIR completed, approvals)
+  const [planning] = await db.select().from(planningRecordsTable).where(eq(planningRecordsTable.changeId, id));
+  const [testing] = await db
+    .select()
+    .from(testRecordsTable)
+    .where(and(eq(testRecordsTable.changeId, id), eq(testRecordsTable.kind, "production")));
+  const [preprodTesting] = await db
+    .select()
+    .from(testRecordsTable)
+    .where(and(eq(testRecordsTable.changeId, id), eq(testRecordsTable.kind, "preprod")));
+  const [pir] = await db.select().from(pirRecordsTable).where(eq(pirRecordsTable.changeId, id));
+  const allApprovals = await db.select().from(approvalsTable).where(eq(approvalsTable.changeId, id));
+  const approvalsAllApproved =
+    allApprovals.length === 0 || allApprovals.every((a) => a.decision === "approved");
+  const gateError = checkPhaseGates({
+    track,
+    fromStatus,
+    toStatus: targetStatus,
+    hasPreprodEnv: !!before.hasPreprodEnv,
+    planning: planning ? { signedOff: planning.signedOff } : null,
+    testing: testing
+      ? {
+          overallResult: testing.overallResult,
+          testedAt: testing.testedAt ?? null,
+          cases: (testing.cases ?? []).map((c) => ({ status: c.status })),
+        }
+      : null,
+    preprodTesting: preprodTesting
+      ? {
+          overallResult: preprodTesting.overallResult,
+          testedAt: preprodTesting.testedAt ?? null,
+        }
+      : null,
+    pir: pir ? { completedAt: pir.completedAt ?? null } : null,
+    approvalsAllApproved,
+  });
+  if (gateError) {
+    res.status(400).json({ error: gateError });
+    return;
+  }
+  // Pre-prod gate: only allow approved → in_preprod_testing when the change
+  // was created with a pre-prod environment. Teams without one skip the
+  // status entirely (approved → scheduled).
+  if (toStatus === "in_preprod_testing" && !before.hasPreprodEnv) {
+    res.status(400).json({ error: "Pre-prod testing requires hasPreprodEnv=true on the change." });
+    return;
+  }
+  const updates: Partial<typeof changeRequestsTable.$inferInsert> = { status: toStatus };
+  if (toStatus === "in_progress" && !before.actualStart) updates.actualStart = new Date();
+  if ((toStatus === "implemented" || toStatus === "completed") && !before.actualEnd) updates.actualEnd = new Date();
+  // Persist the mandatory cancel/reject reason so it is visible on the change
+  // and can be written back to SD+. Reopening a cancelled/rejected change to
+  // draft clears the stale note.
+  if (toStatus === "cancelled" || toStatus === "rejected") updates.closureNote = trimmedNote;
+  if ((fromStatus === "cancelled" || fromStatus === "rejected") && toStatus === "draft") updates.closureNote = null;
+  const [updated] = await db
+    .update(changeRequestsTable)
+    .set(updates)
+    .where(eq(changeRequestsTable.id, id))
+    .returning();
+  await audit(req, {
+    action: "change.transitioned",
+    entityType: "change",
+    entityId: id,
+    summary: `${before.ref}: ${before.status} → ${toStatus}${note ? ` (${note})` : ""}`,
+    before: { status: before.status },
+    after: { status: toStatus, note: note ?? null },
+  });
+  // ─── Notification routing ────────────────────────────────────────────────
+  // The notification stream is intentionally narrow: only four lifecycle
+  // events broadcast email:
+  //   1. submitted   — change enters in_review (normal) or awaiting_approval (emergency direct submit)
+  //   2. cancelled   — toStatus === "cancelled"
+  //   3. completed   — toStatus === "completed" (handled by notifyChangeCompleted)
+  //   4. approved    — fired from /approvals when change_manager grants
+  //   5. test passed — fired from /phases when production testing passes
+  // Generic per-transition notifications and the old "scheduled" broadcast
+  // were removed at user request.
+  const isSubmit =
+    (track === "normal" && fromStatus === "draft" && toStatus === "in_review") ||
+    (track === "emergency" && fromStatus === "draft" && toStatus === "awaiting_approval");
+  if (isSubmit) {
+    const targets = await resolveRecipients("change.submitted", {
+      changeId: before.id,
+      ownerId: before.ownerId,
+      assigneeId: before.assigneeId,
+      track,
+    });
+    if (targets.length > 0) {
+      await notify({
+        eventKey: "change.submitted",
+        to: targets,
+        subject: `[CHG ${before.ref}] Submitted: ${before.title}`,
+        text: `${before.ref} ${before.title}\n\n${before.description ?? ""}\n\nA ${track} change was submitted for review.`,
+      });
+    }
+  }
+  if (toStatus === "cancelled") {
+    const targets = await resolveRecipients("change.cancelled", {
+      changeId: before.id,
+      ownerId: before.ownerId,
+      assigneeId: before.assigneeId,
+      track: before.track,
+    });
+    if (targets.length > 0) {
+      await notify({
+        eventKey: "change.cancelled",
+        to: targets,
+        subject: `[CHG ${before.ref}] Cancelled: ${before.title}`,
+        text: `${before.ref} ${before.title}\n\n${before.description ?? ""}\n\nThis change has been cancelled${note ? `: ${note}` : "."}`,
+      });
+    }
+  }
+  if (toStatus === "completed") {
+    await notifyChangeCompleted(updated);
+  }
+  // ServiceDesk Plus write-back: when a change that originated from an SD+
+  // RFC ticket reaches a terminal state, resolve/reject the ticket with the
+  // milestone history (and rejection note) in the resolution field.
+  // Fire-and-forget — a slow or unreachable SD+ server never blocks the UI.
+  if (updated.sdpRequestId && (toStatus === "completed" || toStatus === "rejected" || toStatus === "cancelled")) {
+    const outcome = toStatus === "completed" ? "Resolved" : toStatus === "rejected" ? "Rejected" : "Cancelled";
+    void sdpSyncTerminalState(updated, outcome, trimmedNote || null).then(async (r) => {
+      await audit(req, {
+        action: r.success ? "integration.sdp_synced" : "integration.sdp_sync_failed",
+        entityType: "change",
+        entityId: updated.id,
+        summary: `${updated.ref}: SD+ request #${updated.sdpRequestId} → ${outcome}: ${r.message}`,
+        after: r,
+      });
+    });
+  }
+  res.json(await expandChangeRow(updated));
+});
+
+// ---------------------------------------------------------------------------
+// REVERT — walk a change BACK to an earlier status.
+//
+// Restricted to Change Manager and Admin (admins implicitly satisfy the
+// requireRole check). Body: { toStatus, reason } — reason is mandatory and
+// must be at least 5 characters so the audit log captures justification.
+//
+// Side-effects on revert:
+//   * Reverting from awaiting_approval / approved (or later) BACK past
+//     awaiting_approval resets every approval row to "pending" so the
+//     change cannot move forward again on stale votes.
+//   * Reverting back across in_progress clears actualStart.
+//   * Reverting back across implemented clears actualEnd.
+//   * Reverting to draft reopens signed-off planning so omissions can be fixed.
+// All side-effects are recorded in the audit row alongside the status flip.
+// ---------------------------------------------------------------------------
+router.post("/changes/:id/revert", requireAuth, async (req, res): Promise<void> => {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return;
+  }
+  const { toStatus, reason } = req.body ?? {};
+  if (typeof toStatus !== "string") {
+    res.status(400).json({ error: "toStatus is required" });
+    return;
+  }
+  if (typeof reason !== "string" || reason.trim().length < 5) {
+    res.status(400).json({ error: "reason is required (minimum 5 characters)" });
+    return;
+  }
+  const session = req.session!;
+  // RBAC — Change Manager OR Admin only. We do not allow owner/assignee to
+  // self-revert: walking a change backward is a governance action.
+  let allowed = session.isAdmin;
+  if (!allowed) {
+    const roles = await loadUserRoles(session.uid);
+    allowed = roles.includes("change_manager");
+  }
+  if (!allowed) {
+    res.status(403).json({ error: "Only a Change Manager or Admin can revert a change." });
+    return;
+  }
+  const [before] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!before || before.deletedAt) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  const track = before.track as ChangeTrack;
+  const fromStatus = before.status as ChangeStatus;
+  const targetStatus = toStatus as ChangeStatus;
+  if (fromStatus === targetStatus) {
+    res.status(400).json({ error: "Change is already in that status." });
+    return;
+  }
+  if (!isReversionAllowed(track, fromStatus, targetStatus)) {
+    res.status(400).json({
+      error: `Revert ${fromStatus} → ${targetStatus} is not allowed for ${track} changes.`,
+      allowed: listAllowedReversions(track, fromStatus),
+    });
+    return;
+  }
+  // Build update payload + side-effects.
+  const updates: Partial<typeof changeRequestsTable.$inferInsert> = { status: targetStatus };
+  // If we are reverting back PAST the implementation point, the previously
+  // recorded execution timestamps become stale. Clear them so a future
+  // forward run records fresh ones.
+  const PRE_EXECUTION: ChangeStatus[] = [
+    "draft",
+    "submitted",
+    "in_review",
+    "awaiting_approval",
+    "approved",
+    "scheduled",
+    "awaiting_implementation",
+  ];
+  if (PRE_EXECUTION.includes(targetStatus)) {
+    updates.actualStart = null;
+    updates.actualEnd = null;
+  } else if (targetStatus === "in_progress") {
+    updates.actualEnd = null;
+  }
+  // Reverting a cancelled/rejected change back to an active status clears the
+  // stale closure note.
+  if (fromStatus === "cancelled" || fromStatus === "rejected") {
+    updates.closureNote = null;
+  }
+  // If we are reverting BACK past awaiting_approval, reset existing approvals
+  // to pending so the change cannot leap forward on stale votes.
+  const PRE_APPROVAL: ChangeStatus[] = ["draft", "submitted", "in_review"];
+  let approvalsResetCount = 0;
+  if (PRE_APPROVAL.includes(targetStatus)) {
+    const reset = await db
+      .update(approvalsTable)
+      .set({ decision: "pending", decidedAt: null, comment: null })
+      .where(eq(approvalsTable.changeId, id))
+      .returning();
+    approvalsResetCount = reset.length;
+  }
+  // Draft means the RFC is editable again. A planning sign-off from the
+  // previous submission must not keep the planning form locked.
+  let planningUnlocked = false;
+  if (targetStatus === "draft") {
+    const reopened = await db
+      .update(planningRecordsTable)
+      .set({ signedOff: false, signedOffAt: null, signedOffBy: null })
+      .where(and(eq(planningRecordsTable.changeId, id), eq(planningRecordsTable.signedOff, true)))
+      .returning();
+    planningUnlocked = reopened.length > 0;
+  }
+  const [updated] = await db
+    .update(changeRequestsTable)
+    .set(updates)
+    .where(eq(changeRequestsTable.id, id))
+    .returning();
+  await audit(req, {
+    action: "change.reverted",
+    entityType: "change",
+    entityId: id,
+    summary: `${before.ref}: REVERTED ${fromStatus} → ${targetStatus} — ${reason.trim()}`,
+    before: { status: before.status, actualStart: before.actualStart, actualEnd: before.actualEnd },
+    after: {
+      status: targetStatus,
+      reason: reason.trim(),
+      approvalsReset: approvalsResetCount,
+      planningUnlocked,
+      actualStartCleared: updates.actualStart === null && before.actualStart != null,
+      actualEndCleared: updates.actualEnd === null && before.actualEnd != null,
+    },
+  });
+  // Reverts are governance actions and are captured by the audit log; they
+  // intentionally do not trigger email notifications (notification stream is
+  // scoped to lifecycle events: submitted / cancelled / completed / approved
+  // / production testing passed).
+  res.json(await expandChangeRow(updated));
+});
+
+export default router;

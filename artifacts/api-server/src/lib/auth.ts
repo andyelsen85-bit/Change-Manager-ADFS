@@ -1,0 +1,374 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import type { Request, Response, NextFunction } from "express";
+import { and, eq } from "drizzle-orm";
+import { db, usersTable, roleAssignmentsTable, changeAssigneesTable } from "@workspace/db";
+
+const NODE_ENV = process.env["NODE_ENV"] ?? "development";
+const RAW_SECRET = process.env["JWT_SECRET"];
+if (NODE_ENV === "production" && (!RAW_SECRET || RAW_SECRET.length < 16)) {
+  throw new Error(
+    "JWT_SECRET environment variable is required in production (min 16 chars). " +
+      "Refusing to start with a default secret.",
+  );
+}
+const JWT_SECRET = RAW_SECRET ?? "dev-only-change-mgmt-secret-do-not-use-in-prod";
+const COOKIE_NAME = "cm_session";
+const CSRF_COOKIE_NAME = "cm_csrf";
+const CSRF_HEADER_NAME = "x-csrf-token";
+const TOKEN_TTL_SECONDS = 60 * 60 * 12;
+
+export type SessionPayload = {
+  uid: number;
+  username: string;
+  isAdmin: boolean;
+};
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      session?: SessionPayload;
+    }
+  }
+}
+
+export async function hashPassword(plain: string): Promise<string> {
+  return bcrypt.hash(plain, 10);
+}
+
+export async function verifyPassword(plain: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(plain, hash);
+}
+
+export function signSession(payload: SessionPayload): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_TTL_SECONDS });
+}
+
+export function verifySession(token: string): SessionPayload | null {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as SessionPayload;
+    return { uid: decoded.uid, username: decoded.username, isAdmin: !!decoded.isAdmin };
+  } catch {
+    return null;
+  }
+}
+
+// Short-lived, signed values used by external authentication handshakes.
+// Keeping this next to the session secret ensures the ADFS state cookie cannot
+// be forged with a different signing key.
+export function signAuthState<T extends object>(payload: T): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "10m" });
+}
+
+export function verifyAuthState<T extends object>(token: string): T | null {
+  try {
+    return jwt.verify(token, JWT_SECRET) as T;
+  } catch {
+    return null;
+  }
+}
+
+// When the app is being viewed inside the Replit preview iframe (or any
+// other cross-site embedding), browsers will only send/receive cookies that
+// are flagged `SameSite=None; Secure`. For plain-HTTP local dev we still
+// want the cookie to work, so we fall back to `SameSite=Lax` without the
+// Secure flag. We detect the channel from `req.secure`, which reflects the
+// `X-Forwarded-Proto` header once `app.set("trust proxy", true)` is set.
+function cookieChannelOptions(req: Request): {
+  sameSite: "lax" | "none";
+  secure: boolean;
+} {
+  const httpsRequest = req.secure || req.protocol === "https";
+  if (httpsRequest || NODE_ENV === "production") {
+    return { sameSite: "none", secure: true };
+  }
+  return { sameSite: "lax", secure: false };
+}
+
+export function setSessionCookie(req: Request, res: Response, token: string): void {
+  const { sameSite, secure } = cookieChannelOptions(req);
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite,
+    secure,
+    maxAge: TOKEN_TTL_SECONDS * 1000,
+    path: "/",
+  });
+}
+
+export function clearSessionCookie(res: Response): void {
+  res.clearCookie(COOKIE_NAME, { path: "/" });
+}
+
+export function generateCsrfToken(): string {
+  return randomBytes(32).toString("hex");
+}
+
+// Sets the CSRF token cookie used by the double-submit pattern. The cookie
+// is intentionally NOT HttpOnly so the frontend can read it and echo the
+// value back in the `X-CSRF-Token` header on every mutating request.
+export function setCsrfCookie(req: Request, res: Response, token: string): void {
+  const { sameSite, secure } = cookieChannelOptions(req);
+  res.cookie(CSRF_COOKIE_NAME, token, {
+    httpOnly: false,
+    sameSite,
+    secure,
+    maxAge: TOKEN_TTL_SECONDS * 1000,
+    path: "/",
+  });
+}
+
+export function clearCsrfCookie(res: Response): void {
+  res.clearCookie(CSRF_COOKIE_NAME, { path: "/" });
+}
+
+export function readCsrfCookie(req: Request): string | null {
+  const value = (req as Request & { cookies?: Record<string, string> }).cookies?.[CSRF_COOKIE_NAME];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+// Double-submit CSRF check: requires the request to carry both the
+// non-HttpOnly `cm_csrf` cookie and a matching `X-CSRF-Token` header on
+// state-changing methods. Safe (read-only) methods are passed through.
+export function requireCsrf(req: Request, res: Response, next: NextFunction): void {
+  const method = req.method.toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    next();
+    return;
+  }
+  const cookieToken = readCsrfCookie(req);
+  const headerRaw = req.headers[CSRF_HEADER_NAME];
+  const headerToken = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+  if (!cookieToken || !headerToken || !safeEqual(cookieToken, headerToken)) {
+    res.status(403).json({ error: "Invalid or missing CSRF token" });
+    return;
+  }
+  next();
+}
+
+export function readSessionCookie(req: Request): SessionPayload | null {
+  const token = (req as Request & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
+  if (!token) return null;
+  return verifySession(token);
+}
+
+// Returns true when the request carried a session cookie that failed verification —
+// i.e. an expired or tampered JWT. Used by middleware to emit `auth.session_expired`
+// audit events distinct from anonymous (no-cookie) traffic.
+export function hasInvalidSessionCookie(req: Request): boolean {
+  const token = (req as Request & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
+  if (!token) return false;
+  return verifySession(token) === null;
+}
+
+async function maybeAuditExpired(req: Request): Promise<void> {
+  if (!hasInvalidSessionCookie(req)) return;
+  // Best-effort; never fail the request because of audit IO.
+  try {
+    const { audit } = await import("./audit");
+    await audit(
+      req,
+      {
+        action: "auth.session_expired",
+        entityType: "user",
+        entityId: null,
+        summary: "Rejected request: expired or invalid session token",
+        after: { reason: "invalid_or_expired_token" },
+      },
+      { id: null, name: "anonymous" },
+    );
+  } catch {
+    // swallow — audit failures shouldn't change request semantics
+  }
+}
+
+// Returns true when the user identified by `uid` is currently flagged as
+// needing to rotate their password (e.g. seeded admin on first login). Used
+// by the auth middlewares to gate all protected API routes — see
+// `enforcePasswordRotated`. The auth/login, auth/me, auth/logout and
+// auth/change-password endpoints intentionally do NOT use `requireAuth`, so
+// they bypass this gate and remain reachable while the flag is set.
+async function userMustChangePassword(uid: number): Promise<boolean> {
+  const [u] = await db
+    .select({ mustChangePassword: usersTable.mustChangePassword })
+    .from(usersTable)
+    .where(eq(usersTable.id, uid));
+  return !!u?.mustChangePassword;
+}
+
+async function enforcePasswordRotated(uid: number, res: Response): Promise<boolean> {
+  if (await userMustChangePassword(uid)) {
+    res.status(403).json({
+      error: "Password rotation required",
+      code: "must_change_password",
+    });
+    return false;
+  }
+  return true;
+}
+
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const session = readSessionCookie(req);
+  if (!session) {
+    await maybeAuditExpired(req);
+    res.status(401).json({ error: "Not authenticated" });
+    return;
+  }
+  if (!(await enforcePasswordRotated(session.uid, res))) return;
+  req.session = session;
+  next();
+}
+
+export async function requireAdmin(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const session = readSessionCookie(req);
+  if (!session) {
+    await maybeAuditExpired(req);
+    res.status(401).json({ error: "Not authenticated" });
+    return;
+  }
+  if (!session.isAdmin) {
+    res.status(403).json({ error: "Admin only" });
+    return;
+  }
+  if (!(await enforcePasswordRotated(session.uid, res))) return;
+  req.session = session;
+  next();
+}
+
+export async function loadUserRoles(userId: number): Promise<string[]> {
+  const rows = await db
+    .select({ roleKey: roleAssignmentsTable.roleKey })
+    .from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.userId, userId));
+  return Array.from(new Set(rows.map((r) => r.roleKey)));
+}
+
+export async function loadUserById(id: number) {
+  const [u] = await db.select().from(usersTable).where(eq(usersTable.id, id));
+  return u;
+}
+
+export function requireRole(roles: string[]) {
+  return async function (req: Request, res: Response, next: NextFunction): Promise<void> {
+    const session = readSessionCookie(req);
+    if (!session) {
+      res.status(401).json({ error: "Not authenticated" });
+      return;
+    }
+    if (!(await enforcePasswordRotated(session.uid, res))) return;
+    if (session.isAdmin) {
+      req.session = session;
+      next();
+      return;
+    }
+    const userRoles = await loadUserRoles(session.uid);
+    const ok = userRoles.some((r) => roles.includes(r));
+    if (!ok) {
+      res.status(403).json({ error: `Requires role: ${roles.join(" or ")}` });
+      return;
+    }
+    req.session = session;
+    next();
+  };
+}
+
+// Governance roles whose holders are authorised to act on any change request
+// regardless of ownership / assignment. These are the cross-cutting roles that
+// run the change-management process: the Change Manager, the eCAB members who
+// authorise emergency changes, and the CAB chair who runs the meeting. Other
+// roles (technical_reviewer, business_owner, implementer, ...) are scoped to
+// their specific contributions and do not get blanket access.
+export const GOVERNANCE_ROLES = ["change_manager", "ecab_member", "cab_chair"] as const;
+export type GovernanceRole = (typeof GOVERNANCE_ROLES)[number];
+
+// Roles that may VIEW any change so they can take part in the CAB process —
+// read the request, its planning / approvals, and cast their approval vote —
+// but are NOT authorised to edit, delete, or transition it. Standing CAB
+// members fall here: they need to open a change to review and vote on it, yet
+// they are not change owners. Deputies of these roles get the same visibility
+// automatically because loadUserRoles ignores the is_deputy flag (a deputy
+// carries the same roleKey, hence the same access, as the primary member).
+export const CHANGE_VIEWER_ROLES = ["cab_member"] as const;
+export type ChangeViewerRole = (typeof CHANGE_VIEWER_ROLES)[number];
+
+export type ChangeAccessReason =
+  | "owner"
+  | "assignee"
+  | "per_change_assignee"
+  | "admin"
+  | GovernanceRole
+  | ChangeViewerRole
+  | "authenticated"
+  | null;
+
+export async function getChangeAccess(
+  session: SessionPayload,
+  change: { id?: number; ownerId: number; assigneeId: number | null },
+): Promise<ChangeAccessReason> {
+  if (session.isAdmin) return "admin";
+  if (change.ownerId === session.uid) return "owner";
+  if (change.assigneeId === session.uid) return "assignee";
+  const userRoles = await loadUserRoles(session.uid);
+  for (const role of GOVERNANCE_ROLES) {
+    if (userRoles.includes(role)) return role;
+  }
+  // Per-change assignees (Implementer / Tester picked in the Assignees tab)
+  // get full working access to THEIR change — they must be able to start
+  // implementation, fill in testing records, and transition statuses.
+  // Explicit user requirement (July 2026). Not privileged: isPrivilegedAccess
+  // stays admin/governance-only, so they cannot delete, move a change into
+  // approval, or override a signed-off planning record.
+  if (typeof change.id === "number") {
+    const [row] = await db
+      .select({ id: changeAssigneesTable.id })
+      .from(changeAssigneesTable)
+      .where(and(eq(changeAssigneesTable.changeId, change.id), eq(changeAssigneesTable.userId, session.uid)))
+      .limit(1);
+    if (row) return "per_change_assignee";
+  }
+  return null;
+}
+
+// Read-only access gate. Grants everything getChangeAccess grants (owner,
+// assignee, admin, governance) PLUS the view-only CAB roles, so standing CAB
+// members — and their deputies — can open a change to review and vote on it.
+// Used by every READ endpoint. WRITE endpoints keep using getChangeAccess so a
+// viewer role can never edit / delete / transition a change. This split is
+// intentionally fail-closed: a missed read endpoint just leaves a viewer
+// unable to see something, never able to mutate it.
+export async function getChangeViewAccess(
+  session: SessionPayload,
+  change: { ownerId: number; assigneeId: number | null },
+): Promise<ChangeAccessReason> {
+  const acting = await getChangeAccess(session, change);
+  if (acting) return acting;
+  const userRoles = await loadUserRoles(session.uid);
+  for (const role of CHANGE_VIEWER_ROLES) {
+    if (userRoles.includes(role)) return role;
+  }
+  // Change visibility is org-wide by design: every authenticated user can
+  // READ every change (list + detail + subresources). Write endpoints keep
+  // using getChangeAccess, so this never grants edit/transition rights.
+  // NOTE: pentest records have their own, stricter need-to-know gate — this
+  // fallback only applies to change requests.
+  return "authenticated";
+}
+
+// Returns true when the access reason represents a privileged caller — admin
+// or any governance role — i.e. someone who can perform restricted operations
+// (deletion, signed-off planning override, transitions into the approval
+// state) regardless of whether they are owner / assignee.
+export function isPrivilegedAccess(reason: ChangeAccessReason): boolean {
+  if (reason === "admin") return true;
+  if (reason === null) return false;
+  return (GOVERNANCE_ROLES as readonly string[]).includes(reason);
+}

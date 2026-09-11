@@ -1,0 +1,9 @@
+- [Change access & deputy model](change-access-model.md) — read gate (getChangeViewAccess incl. cab_member) vs write gate (getChangeAccess incl. per-change implementer/tester); deputies==primaries; isPrivilegedAccess stays admin/governance-only.
+- [API route test mocking](api-route-test-mocking.md) — route tests mock @workspace/db table-by-table; new table/helper imports in a route 500 existing suites until added to every affected test's mock.
+- [Soft-delete visibility gate](soft-delete-visibility.md) — every route that loads a change (incl. subresources & dashboard joins) must 404 on deletedAt; restore/purge use conditional writes on deleted_at for race safety.
+- [Stale TS project references](ts-project-references.md) — after editing lib/db schema, rebuild refs (`pnpm exec tsc -b lib/db --force`) or dependent packages typecheck against old declarations.
+- [CAB recurrence timezone](cab-recurrence-timezone.md) — recurring occurrences keep wall-clock time via per-candidate offset delta vs first occurrence; never step from the adjusted previous.
+- [CAB outcomes & attendance](cab-outcomes-attendance.md) — only "postponed" stored; approved/rejected derived from votes; PATCH must diff cab_changes; externals get negative userIds + email dedup.
+- [pnpm lockfile drizzle split](pnpm-lockfile-drizzle-split.md) — temp add/remove of a dep in one package can split drizzle-orm peer instances; fix by reverting pnpm-lock.yaml + pnpm install.
+- [Potential standard promotion](potential-standard-promotion.md) — promotion counts = normal+completed+not-deleted only; links only to disabled templates; track switch clears the link.
+- [ServiceDesk Plus integration](sdp-integration.md) — on-prem SD+ webhook + resolve/reject write-back: header-only secret, CSRF exemption, partial unique index for idempotency, sync hooks in 2 places.

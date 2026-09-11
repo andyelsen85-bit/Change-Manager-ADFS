@@ -1,0 +1,310 @@
+// ITIL v4-aligned change request state machines.
+// Each track has its own allowed transition graph. Terminal statuses cancelled / rolled_back
+// are reachable from any non-terminal status. Standard changes auto-progress through approval/CAB
+// stages and skip awaiting_approval entirely.
+
+export type ChangeTrack = "normal" | "standard" | "emergency";
+
+export type ChangeStatus =
+  | "draft"
+  | "submitted"
+  | "in_review"
+  | "awaiting_approval"
+  | "approved"
+  | "in_preprod_testing"
+  | "rejected"
+  | "scheduled"
+  | "awaiting_implementation"
+  | "in_progress"
+  | "implemented"
+  | "in_testing"
+  | "awaiting_pir"
+  | "completed"
+  | "cancelled"
+  | "rolled_back";
+
+const TERMINAL_FROM_ANY: ChangeStatus[] = ["cancelled", "rolled_back"];
+
+const NORMAL: Record<ChangeStatus, ChangeStatus[]> = {
+  draft: ["in_review", "cancelled"],
+  submitted: ["in_review", "cancelled"],
+  in_review: ["awaiting_approval", "rejected", "cancelled"],
+  awaiting_approval: ["approved", "rejected", "cancelled"],
+  // Optional pre-prod testing phase. The Implementer drives `in_preprod_testing`
+  // and exits to `scheduled` once dry-run validation in the pre-prod env is
+  // complete. Teams without a pre-prod env skip directly to `scheduled`.
+  approved: ["in_preprod_testing", "scheduled", "cancelled"],
+  in_preprod_testing: ["scheduled", "approved", "cancelled"],
+  scheduled: ["in_progress", "cancelled"],
+  in_progress: ["implemented", "rolled_back"],
+  // Testing is optional — teams can either record a Testing pass first
+  // (implemented → in_testing → awaiting_pir) or jump straight to PIR if the
+  // change didn't need a separate testing phase (implemented → awaiting_pir).
+  implemented: ["in_testing", "awaiting_pir", "rolled_back"],
+  in_testing: ["awaiting_pir", "rolled_back"],
+  awaiting_pir: ["completed", "rolled_back"],
+  completed: [],
+  rejected: [],
+  cancelled: [],
+  rolled_back: [],
+  awaiting_implementation: [],
+};
+
+// Standard changes auto-approve and bypass CAB; flow is short.
+const STANDARD: Record<ChangeStatus, ChangeStatus[]> = {
+  draft: ["scheduled", "awaiting_implementation", "cancelled"],
+  awaiting_implementation: ["scheduled", "in_progress", "cancelled"],
+  scheduled: ["in_progress", "cancelled"],
+  in_progress: ["implemented", "rolled_back"],
+  implemented: ["completed", "rolled_back"],
+  completed: [],
+  cancelled: [],
+  rolled_back: [],
+  // Unused for standard track but needed to satisfy type:
+  submitted: [],
+  in_review: [],
+  awaiting_approval: [],
+  approved: [],
+  rejected: [],
+  in_testing: [],
+  awaiting_pir: [],
+  in_preprod_testing: [],
+};
+
+// Emergency: collapsed flow but eCAB approval is mandatory before implementation.
+// Approval may be granted out-of-band (phone/IM) and then recorded in the system,
+// but the system enforces approved -> in_progress: no draft -> in_progress shortcut.
+const EMERGENCY: Record<ChangeStatus, ChangeStatus[]> = {
+  // Collapsed flow: no Submitted / In review / Scheduled / In testing hops.
+  // Requester sends the change straight to the eCAB for approval; PIR is
+  // still required before the change can be closed.
+  draft: ["awaiting_approval", "cancelled"],
+  awaiting_approval: ["approved", "rejected", "cancelled"],
+  approved: ["in_progress", "cancelled"],
+  in_progress: ["implemented", "rolled_back"],
+  implemented: ["awaiting_pir", "rolled_back"],
+  awaiting_pir: ["completed", "rolled_back"],
+  completed: [],
+  rejected: [],
+  cancelled: [],
+  rolled_back: [],
+  // Unused for emergency:
+  submitted: [],
+  in_review: [],
+  scheduled: [],
+  awaiting_implementation: [],
+  in_testing: [],
+  in_preprod_testing: [],
+};
+
+const TRANSITIONS_BY_TRACK: Record<ChangeTrack, Record<ChangeStatus, ChangeStatus[]>> = {
+  normal: NORMAL,
+  standard: STANDARD,
+  emergency: EMERGENCY,
+};
+
+// ---------------------------------------------------------------------------
+// REVERSE TRANSITIONS — controlled "walk-back" graphs.
+//
+// The forward graph is strict: a Normal change can only progress draft → …
+// → completed. In real ITIL operations changes are sometimes pushed forward
+// prematurely (the reviewer hits "Send for approval" before the Change
+// Manager is ready, or a CAB needs to rework an already-approved change).
+// We expose a separate "revert" action restricted to Change Manager / Admin
+// that walks the change BACK to a sensible earlier status. The maps below
+// list, for each current status, which prior statuses are valid revert
+// targets. `rolled_back` is intentionally empty: a physically rolled-back
+// change cannot be un-rolled back.
+// ---------------------------------------------------------------------------
+
+const REVERSE_NORMAL: Record<ChangeStatus, ChangeStatus[]> = {
+  draft: [],
+  submitted: ["draft"],
+  in_review: ["draft"],
+  awaiting_approval: ["in_review", "draft"],
+  approved: ["awaiting_approval", "in_review", "draft"],
+  scheduled: ["approved", "awaiting_approval"],
+  in_progress: ["scheduled", "approved"],
+  implemented: ["in_progress"],
+  in_testing: ["implemented", "in_progress"],
+  awaiting_pir: ["in_testing", "implemented"],
+  completed: ["awaiting_pir"], // reopen after closure
+  cancelled: ["draft"], // reopen a cancelled change
+  rejected: ["draft", "in_review"], // reopen a rejected change
+  rolled_back: [], // truly terminal
+  awaiting_implementation: [],
+  in_preprod_testing: ["approved", "awaiting_approval"],
+};
+
+const REVERSE_STANDARD: Record<ChangeStatus, ChangeStatus[]> = {
+  draft: [],
+  awaiting_implementation: ["draft"],
+  scheduled: ["awaiting_implementation", "draft"],
+  in_progress: ["scheduled", "awaiting_implementation"],
+  implemented: ["in_progress"],
+  completed: ["implemented"],
+  cancelled: ["draft"],
+  rolled_back: [],
+  // unused for standard
+  submitted: [],
+  in_review: [],
+  awaiting_approval: [],
+  approved: [],
+  rejected: [],
+  in_testing: [],
+  awaiting_pir: [],
+  in_preprod_testing: [],
+};
+
+const REVERSE_EMERGENCY: Record<ChangeStatus, ChangeStatus[]> = {
+  draft: [],
+  awaiting_approval: ["draft"],
+  approved: ["awaiting_approval", "draft"],
+  in_progress: ["approved"],
+  implemented: ["in_progress"],
+  awaiting_pir: ["implemented"],
+  completed: ["awaiting_pir"],
+  cancelled: ["draft"],
+  rejected: ["draft", "awaiting_approval"],
+  rolled_back: [],
+  // unused for emergency
+  submitted: [],
+  in_review: [],
+  scheduled: [],
+  awaiting_implementation: [],
+  in_testing: [],
+  in_preprod_testing: [],
+};
+
+const REVERSIONS_BY_TRACK: Record<ChangeTrack, Record<ChangeStatus, ChangeStatus[]>> = {
+  normal: REVERSE_NORMAL,
+  standard: REVERSE_STANDARD,
+  emergency: REVERSE_EMERGENCY,
+};
+
+export function listAllowedReversions(track: ChangeTrack, from: ChangeStatus): ChangeStatus[] {
+  return Array.from(new Set(REVERSIONS_BY_TRACK[track][from] ?? []));
+}
+
+export function isReversionAllowed(track: ChangeTrack, from: ChangeStatus, to: ChangeStatus): boolean {
+  return listAllowedReversions(track, from).includes(to);
+}
+
+export function isTransitionAllowed(track: ChangeTrack, from: ChangeStatus, to: ChangeStatus): boolean {
+  if (TERMINAL_FROM_ANY.includes(to)) {
+    // cancelled/rolled_back are reachable from any non-terminal, but not from another terminal
+    const isTerminalNow = TRANSITIONS_BY_TRACK[track][from]?.length === 0;
+    if (isTerminalNow) return false;
+    if (to === "rolled_back") {
+      // rolled_back only from execution/post-execution states
+      return ["in_progress", "implemented", "in_testing", "in_preprod_testing", "awaiting_pir", "completed"].includes(from);
+    }
+    return true;
+  }
+  const allowed = TRANSITIONS_BY_TRACK[track][from] ?? [];
+  return allowed.includes(to);
+}
+
+export function listAllowedTransitions(track: ChangeTrack, from: ChangeStatus): ChangeStatus[] {
+  const base = TRANSITIONS_BY_TRACK[track][from] ?? [];
+  return Array.from(new Set(base));
+}
+
+// Phase gates — additional checks beyond raw state-machine reachability.
+// These are evaluated in changes.ts /transition handler. Returning a non-null string
+// means "block with this 400 reason".
+export type PhaseGateInputs = {
+  track: ChangeTrack;
+  fromStatus?: ChangeStatus;
+  toStatus: ChangeStatus;
+  hasPreprodEnv?: boolean;
+  planning: { signedOff: boolean } | null;
+  testing: {
+    overallResult: string;
+    testedAt?: Date | null;
+    cases: Array<{ status: "pending" | "passed" | "failed" | "blocked" }>;
+  } | null;
+  preprodTesting?: {
+    overallResult: string;
+    testedAt?: Date | null;
+  } | null;
+  pir: { completedAt: Date | null } | null;
+  approvalsAllApproved: boolean;
+};
+
+export function checkPhaseGates(p: PhaseGateInputs): string | null {
+  // Approvals must be complete before leaving awaiting_approval to approved (normal/emergency).
+  // (Already enforced by approvals.ts when last approval flips to approved.)
+  // Cannot enter scheduled without an approved state having occurred (normal track).
+  if (p.track === "normal" && p.toStatus === "scheduled" && !p.approvalsAllApproved) {
+    return "All required approvals must be granted before scheduling.";
+  }
+  if (p.track === "emergency" && p.toStatus === "approved" && !p.approvalsAllApproved) {
+    return "eCAB approval has not been recorded.";
+  }
+  // Normal track: the awaiting_approval -> approved flip itself must be gated
+  // on every approval row being explicitly approved. Otherwise a Change Manager
+  // (or admin) could click "→ Approved" on the status bar and skip the vote.
+  // The auto-flip path in approvals.ts already enforces this when the last
+  // vote lands; this guard catches the manual status-button path.
+  if (p.track === "normal" && p.toStatus === "approved" && !p.approvalsAllApproved) {
+    return "All required approvals must be recorded before the change can be marked Approved.";
+  }
+  // Defense in depth: even if a change has somehow been pre-flipped to
+  // `approved`, we re-check that every approval row is explicitly approved
+  // before allowing the Emergency change to be implemented. Abstains and
+  // pending votes do NOT satisfy this gate.
+  if (p.track === "emergency" && p.toStatus === "in_progress" && !p.approvalsAllApproved) {
+    return "All eCAB approvals must be explicitly approved before implementation.";
+  }
+  // Same defense in depth for Normal: scheduling already requires it (above),
+  // but in_progress should likewise reject abstains slipping through.
+  if (p.track === "normal" && p.toStatus === "in_progress" && !p.approvalsAllApproved) {
+    return "All required approvals must be explicitly approved before implementation.";
+  }
+  // Cannot enter in_progress on a normal change without planning sign-off.
+  if (p.track === "normal" && p.toStatus === "in_progress") {
+    if (!p.planning || !p.planning.signedOff) {
+      return "Implementation cannot start until the planning record is signed off.";
+    }
+  }
+  // Standard changes also require planning sign-off (they have prefilled planning, but it must be acknowledged).
+  if (p.track === "standard" && p.toStatus === "in_progress") {
+    if (!p.planning || !p.planning.signedOff) {
+      return "Standard change requires the planning record to be signed off.";
+    }
+  }
+  // Normal track: once the team enters Testing, the record must be signed off
+  // before PIR can begin. Both PASS and FAIL are valid completed outcomes: a
+  // failed test is precisely something the PIR must be able to review.
+  if (p.track === "normal" && p.toStatus === "awaiting_pir") {
+    const testingSignedOff =
+      p.testing != null &&
+      p.testing.overallResult !== "pending" &&
+      p.testing.testedAt != null;
+    if (p.fromStatus === "in_testing") {
+      if (!testingSignedOff) {
+        return "Testing must be signed off as PASS or FAIL before requesting PIR.";
+      }
+    } else if (p.testing && !testingSignedOff) {
+      return "Testing must be signed off as PASS or FAIL before requesting PIR.";
+    }
+  }
+  // Pre-prod testing must be signed off as PASSED before the change can be
+  // moved on to scheduling. Only enforced when the change opted into a pre-prod
+  // environment AND a pre-prod test record has actually been opened — teams
+  // that skip the form go straight from in_preprod_testing to scheduled.
+  if (p.track === "normal" && p.toStatus === "scheduled" && p.hasPreprodEnv) {
+    if (p.preprodTesting && (p.preprodTesting.overallResult !== "passed" || !p.preprodTesting.testedAt)) {
+      return "Pre-prod testing must be signed off as PASSED before scheduling.";
+    }
+  }
+  // Cannot mark completed without PIR completion.
+  if ((p.track === "normal" || p.track === "emergency") && p.toStatus === "completed") {
+    if (!p.pir || !p.pir.completedAt) {
+      return "Post-Implementation Review must be completed before closing the change.";
+    }
+  }
+  // Standard track: completion only from implemented (state machine already enforces); no PIR required.
+  return null;
+}

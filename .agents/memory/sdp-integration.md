@@ -1,0 +1,18 @@
+---
+name: ServiceDesk Plus integration decisions
+description: Design decisions and constraints for the SD+ (on-prem) integration in Change-it
+---
+
+- SD+ is **on-premises**: auth is a static `technician_key` header against REST API v3; body is form-encoded `input_data` JSON. Status names used on tickets: only **Resolved** and **Rejected** (no Closed), per user requirement.
+- Inbound flow is **manual**: a technician clicks a "Create Change" custom trigger in SD+ which POSTs to `/api/integrations/sdp/create-change`, authenticated by a shared secret in the `X-Webhook-Secret` header only (never query param — leaks into proxy logs).
+- **Why header-only + timing-safe compare + CSRF exemption:** server-to-server webhook has no session; any new webhook path must be added to `CSRF_EXEMPT_POST_PATHS` in api-server `app.ts` or it 403s.
+- Webhook accepts `change_type` (normal | standard | emergency; urgent/urgency alias emergency) and optional `template` name for the standard track. Standard without a matching active template stays standard with `template_id` NULL; the transition endpoint blocks standard drafts leaving draft (except cancel) until a template is linked, and PATCH /changes/:id accepts `templateId` only for standard drafts (validates active, applies prefills non-destructively, bumps usage count) — never silently bypasses approvals. Webhook-created drafts get the same approval scaffolding as UI-created changes (`createApprovalsForChange`, exported from routes/changes.ts).
+- SD+ sends rich-text fields (description, sometimes subject) as full HTML documents with entities; webhook converts to plain text server-side (`htmlToPlainText` in routes/sdp.ts). Accented chars arriving as `?`/`�` are mojibake created on the SD+ server: the executor PowerShell script must read `$COMPLETE_V3_JSON_FILE` with `-Encoding UTF8` AND send the body as UTF-8 bytes with `charset=utf-8` — cannot be repaired server-side.
+- On change creation, the webhook fires a best-effort status write-back to SD+ (configurable name, default "Waiting for Change-it"; empty disables). SD+ rejects status names that don't exist in its config — the status must be created in SD+ Admin → Helpdesk Customizer with the exact name.
+- Webhook people mapping: a technician-email match makes that user both Creator (`ownerId`) and Owner (`assigneeId`); requester-email or admin-fallback matches set Creator only, leaving Owner unassigned so the handler picks deliberately. SD+ requester becomes the external requester name.
+- Drizzle wraps Postgres errors: the pg error `code` (e.g. 23505) may live on `err.cause.code`, not `err.code` — check both when narrowing catch blocks.
+- Idempotency is guaranteed by a **partial unique index** on `change_requests.sdp_request_id WHERE deleted_at IS NULL`, with insert-conflict fallback returning the winner. Read-then-insert alone loses concurrent-delivery races (architect finding).
+- Terminal write-back fires from TWO places: the transition endpoint (completed/rejected) AND the approvals auto-flip to rejected. Any new path that sets a terminal status must also call `sdpSyncTerminalState` (fire-and-forget, audited as `integration.sdp_synced`/`_sync_failed`).
+- Resolution text pushed to SD+ = milestone timeline built from `audit_log` rows (change.created/transitioned/reverted, approval.voted) + rejection note.
+- `audit_log` is append-only (DB trigger blocks DELETE/UPDATE) — cleanup scripts must not touch it and multi-statement psql commands touching it roll back everything.
+- TLS to internal SD+: `tlsRejectUnauthorized` toggle implemented via undici Agent dispatcher; undici v8 types clash with global fetch types — build init as `Record<string, unknown>` and cast at the fetch call.

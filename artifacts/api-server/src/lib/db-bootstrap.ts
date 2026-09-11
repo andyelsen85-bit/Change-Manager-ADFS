@@ -1,0 +1,193 @@
+import { sql } from "drizzle-orm";
+import { db } from "@workspace/db";
+import { logger } from "./logger";
+
+// Database-level guarantees that complement the ORM schema. These run on every server
+// boot and are idempotent. Most importantly: enforce immutability of the audit log via
+// triggers so even a compromised application cannot UPDATE or DELETE audit rows.
+
+const AUDIT_IMMUTABLE_SQL = `
+CREATE OR REPLACE FUNCTION audit_log_block_modifications() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'audit_log is append-only: % operations are not permitted', TG_OP
+    USING ERRCODE = '0A000';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_log_no_update ON audit_log;
+CREATE TRIGGER audit_log_no_update
+  BEFORE UPDATE ON audit_log
+  FOR EACH ROW EXECUTE FUNCTION audit_log_block_modifications();
+
+DROP TRIGGER IF EXISTS audit_log_no_delete ON audit_log;
+CREATE TRIGGER audit_log_no_delete
+  BEFORE DELETE ON audit_log
+  FOR EACH ROW EXECUTE FUNCTION audit_log_block_modifications();
+
+DROP TRIGGER IF EXISTS audit_log_no_truncate ON audit_log;
+CREATE TRIGGER audit_log_no_truncate
+  BEFORE TRUNCATE ON audit_log
+  FOR EACH STATEMENT EXECUTE FUNCTION audit_log_block_modifications();
+`;
+
+// Idempotent column additions for fields the validator requires that pre-date a fresh
+// drizzle-kit migration. Safe to run on every boot.
+const SCHEMA_UPGRADE_SQL = `
+ALTER TABLE standard_templates ADD COLUMN IF NOT EXISTS usage_count integer NOT NULL DEFAULT 0;
+ALTER TABLE standard_templates ADD COLUMN IF NOT EXISTS prefilled_scope text;
+ALTER TABLE standard_templates ADD COLUMN IF NOT EXISTS prefilled_rollback_plan text;
+ALTER TABLE standard_templates ADD COLUMN IF NOT EXISTS prefilled_risk_assessment text;
+ALTER TABLE standard_templates ADD COLUMN IF NOT EXISTS prefilled_impacted_services text;
+ALTER TABLE standard_templates ADD COLUMN IF NOT EXISTS prefilled_communications_plan text;
+ALTER TABLE standard_templates ADD COLUMN IF NOT EXISTS prefilled_success_criteria text;
+ALTER TABLE planning_records ADD COLUMN IF NOT EXISTS to_inform_spoc boolean NOT NULL DEFAULT false;
+ALTER TABLE planning_records ADD COLUMN IF NOT EXISTS procedure text NOT NULL DEFAULT '';
+
+-- Potential Standard Change: link a normal change to a disabled template being
+-- trialled, plus the single-row promotion-threshold configuration.
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS potential_template_id integer;
+-- Re-changes are independent requests with a pointer to their original.
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS parent_change_id integer;
+CREATE INDEX IF NOT EXISTS change_requests_parent_change_id_idx
+  ON change_requests (parent_change_id);
+CREATE TABLE IF NOT EXISTS template_settings (
+  key                  text PRIMARY KEY DEFAULT 'global',
+  promotion_threshold  integer NOT NULL DEFAULT 5
+);
+INSERT INTO template_settings (key) VALUES ('global')
+  ON CONFLICT (key) DO NOTHING;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password boolean NOT NULL DEFAULT false;
+
+-- Notification batching: queue + per-install configuration. Created here so a
+-- fresh boot after pulling the new schema does not require running drizzle-kit
+-- push manually. All statements are idempotent.
+CREATE TABLE IF NOT EXISTS notification_queue (
+  id           serial PRIMARY KEY,
+  user_id      integer NOT NULL,
+  event_key    text NOT NULL,
+  subject      text NOT NULL,
+  body_text    text NOT NULL DEFAULT '',
+  body_html    text NOT NULL DEFAULT '',
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  sent_at      timestamptz
+);
+CREATE INDEX IF NOT EXISTS notification_queue_pending_idx
+  ON notification_queue (sent_at, user_id);
+
+CREATE TABLE IF NOT EXISTS notification_settings (
+  key                      text PRIMARY KEY DEFAULT 'global',
+  batch_interval_minutes   integer NOT NULL DEFAULT 15,
+  last_run_at              timestamptz
+);
+INSERT INTO notification_settings (key) VALUES ('global')
+  ON CONFLICT (key) DO NOTHING;
+
+-- PIR deadline escalation: remember when the <10-days-left reminder was sent
+-- so the periodic check emails the Change Manager pool exactly once per change.
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS pir_reminder_sent_at timestamptz;
+
+-- Recycle bin: soft-deleted changes keep their row (and history) but carry a
+-- deleted_at stamp; deleted_by_id records the admin who removed it.
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS deleted_by_id integer;
+
+-- Separate the immutable RFC creator from the mutable operational owner.
+-- Existing installations used owner_id for both, so preserve its historical
+-- value as the creator before any future reassignment can occur.
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS created_by_id integer;
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS requester_user_id integer;
+UPDATE change_requests SET created_by_id = owner_id WHERE created_by_id IS NULL;
+CREATE INDEX IF NOT EXISTS change_requests_created_by_id_idx ON change_requests (created_by_id);
+CREATE INDEX IF NOT EXISTS change_requests_requester_user_id_idx ON change_requests (requester_user_id);
+
+-- Per-user discussion read state. One row per (user, change); last_read_at is
+-- compared against the newest comment timestamp to decide "unread".
+CREATE TABLE IF NOT EXISTS discussion_reads (
+  user_id      integer NOT NULL,
+  change_id    integer NOT NULL,
+  last_read_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, change_id)
+);
+
+-- ServiceDesk Plus (on-premises) integration: connection settings + link
+-- column on change_requests. The webhook secret authenticates inbound
+-- "Create Change" calls from SD+ custom triggers.
+CREATE TABLE IF NOT EXISTS sdp_settings (
+  key                      text PRIMARY KEY DEFAULT 'global',
+  enabled                  boolean NOT NULL DEFAULT false,
+  base_url                 text NOT NULL DEFAULT '',
+  technician_key_enc       text,
+  webhook_secret           text NOT NULL DEFAULT '',
+  tls_reject_unauthorized  boolean NOT NULL DEFAULT true,
+  on_create_status_name    text NOT NULL DEFAULT 'Waiting for Change-it',
+  last_webhook_at          timestamptz,
+  last_webhook_request_id  text,
+  last_webhook_status      text
+);
+ALTER TABLE sdp_settings ADD COLUMN IF NOT EXISTS on_create_status_name text NOT NULL DEFAULT 'Waiting for Change-it';
+ALTER TABLE change_requests ADD COLUMN IF NOT EXISTS sdp_request_id text;
+
+-- External changes: third-party maintenance windows shown on the Change
+-- Plannings calendar for visibility only (no workflow/approvals).
+CREATE TABLE IF NOT EXISTS external_changes (
+  id          serial PRIMARY KEY,
+  title       text NOT NULL,
+  provider    text NOT NULL DEFAULT '',
+  description text,
+  start_at    timestamptz NOT NULL,
+  end_at      timestamptz,
+  created_by  integer,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+-- At most ONE active (non-deleted) change per SD+ request — makes the
+-- webhook idempotent even under concurrent replay delivery.
+CREATE UNIQUE INDEX IF NOT EXISTS change_requests_sdp_request_id_active_uq
+  ON change_requests (sdp_request_id) WHERE deleted_at IS NULL AND sdp_request_id IS NOT NULL;
+
+-- CAB outcomes & attendance (v2.1.x): docket-level outcome columns read by
+-- GET /cab-meetings/:id — a deployment whose migrate step did not apply
+-- these would 500 on every meeting fetch, so they self-heal here.
+ALTER TABLE cab_changes ADD COLUMN IF NOT EXISTS outcome text;
+ALTER TABLE cab_changes ADD COLUMN IF NOT EXISTS outcome_note text;
+ALTER TABLE cab_changes ADD COLUMN IF NOT EXISTS postponed_to_meeting_id integer;
+CREATE TABLE IF NOT EXISTS cab_attendees (
+  id         serial PRIMARY KEY,
+  meeting_id integer NOT NULL,
+  user_id    integer,
+  name       text NOT NULL,
+  email      text NOT NULL DEFAULT '',
+  present    boolean NOT NULL DEFAULT false,
+  CONSTRAINT cab_attendees_meeting_id_user_id_email_unique UNIQUE (meeting_id, user_id, email)
+);
+
+-- The Workflow Timings settings feature was removed in v2.1.6; dropping the
+-- table here keeps drizzle-kit push from prompting interactively (and thus
+-- hanging the non-TTY migrate container) about the table removal.
+DROP TABLE IF EXISTS workflow_timeouts;
+`;
+
+// Cleanup: per policy update, Technical Reviewer and Business Owner are no longer
+// distinct approvers on Normal-track changes. Drop any STILL-PENDING approval rows
+// for these roles so in-flight changes can proceed; rows already decided
+// (approved/rejected/abstain) are preserved for the historical audit trail.
+const CLEANUP_OBSOLETE_APPROVERS_SQL = `
+DELETE FROM approvals
+WHERE decision = 'pending'
+  AND role_key IN ('technical_reviewer', 'business_owner');
+`;
+
+export async function applyDbConstraints(): Promise<void> {
+  try {
+    await db.execute(sql.raw(SCHEMA_UPGRADE_SQL));
+    await db.execute(sql.raw(AUDIT_IMMUTABLE_SQL));
+    const cleanup = await db.execute(sql.raw(CLEANUP_OBSOLETE_APPROVERS_SQL));
+    logger.info(
+      { obsoleteApproverRowsRemoved: (cleanup as { rowCount?: number }).rowCount ?? 0 },
+      "DB constraints applied: audit_log is append-only; schema upgrades synced; obsolete approver rows pruned.",
+    );
+  } catch (err) {
+    logger.error({ err }, "Failed to apply DB bootstrap (audit triggers / schema upgrade / cleanup)");
+    throw err;
+  }
+}

@@ -1,0 +1,359 @@
+import { Router, type IRouter } from "express";
+import { and, desc, eq, gte, inArray, isNull, or } from "drizzle-orm";
+import {
+  db,
+  changeRequestsTable,
+  cabMeetingsTable,
+  approvalsTable,
+  auditLogTable,
+  roleAssignmentsTable,
+  changeAssigneesTable,
+  testRecordsTable,
+  pirRecordsTable,
+} from "@workspace/db";
+import { requireAuth, requireAdmin } from "../lib/auth";
+import PDFDocument from "pdfkit";
+
+const router: IRouter = Router();
+
+const OPEN_STATUSES = [
+  "draft",
+  "submitted",
+  "in_review",
+  "awaiting_approval",
+  "approved",
+  "in_preprod_testing",
+  "scheduled",
+  "in_progress",
+  "implemented",
+  "in_testing",
+  "awaiting_implementation",
+  "awaiting_pir",
+];
+
+/**
+ * Resolve a `range` query value into an inclusive [start, end] window over
+ * `created_at`. Always anchored to whole calendar months so the result is
+ * stable regardless of the time of day the request is made.
+ *
+ * Supported values:
+ *   - "all" (default)  : no filtering
+ *   - "last_month"     : the previous calendar month (e.g. on 2026-05-07
+ *                        this is 2026-04-01 00:00 .. 2026-04-30 23:59:59.999)
+ *   - "last_6_months"  : rolling 6 months back from now (e.g. on 2026-05-07
+ *                        this is 2025-11-07 00:00 .. now)
+ *   - "last_year"      : rolling 12 months back from now (e.g. on 2026-05-07
+ *                        this is 2025-05-07 00:00 .. now)
+ *
+ * Returns `null` for "all" / unknown values so callers can skip filtering.
+ */
+function resolveRange(range: string | undefined): { start: Date; end: Date } | null {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth(); // 0-based
+  switch (range) {
+    case "last_month": {
+      // Previous calendar month: from day 1 to last instant of that month.
+      const start = new Date(y, m - 1, 1, 0, 0, 0, 0);
+      const end = new Date(y, m, 0, 23, 59, 59, 999); // day 0 of current month = last day of previous
+      return { start, end };
+    }
+    case "last_6_months": {
+      // Rolling 6 months back from today (inclusive of today). Day-of-month
+      // is preserved; if the target month doesn't have that day (e.g. Aug 31
+      // - 6 months would be Feb 31), Date arithmetic rolls forward, which is
+      // acceptable for a dashboard window.
+      const start = new Date(y, m - 6, now.getDate(), 0, 0, 0, 0);
+      return { start, end: now };
+    }
+    case "last_year": {
+      // Rolling 12 months back from today (inclusive of today).
+      const start = new Date(y - 1, m, now.getDate(), 0, 0, 0, 0);
+      return { start, end: now };
+    }
+    default:
+      return null;
+  }
+}
+
+router.get("/dashboard/summary", requireAuth, async (req, res): Promise<void> => {
+  const range = resolveRange(typeof req.query.range === "string" ? req.query.range : undefined);
+  // We pull all rows then filter in-process. The dataset is small (single-org
+  // change log) and this keeps the in-memory aggregations identical to the
+  // unfiltered branch — switching to SQL aggregates would only matter once
+  // we hit tens of thousands of changes.
+  const allRaw = (await db.select().from(changeRequestsTable)).filter((c) => !c.deletedAt);
+  const all = range
+    ? allRaw.filter((c) => c.createdAt >= range.start && c.createdAt <= range.end)
+    : allRaw;
+  const totalChanges = all.length;
+  const openChanges = all.filter((c) => OPEN_STATUSES.includes(c.status)).length;
+  const awaitingApproval = all.filter((c) => c.status === "awaiting_approval" || c.status === "in_review").length;
+  const now = new Date();
+  const weekFromNow = new Date(now.getTime() + 7 * 86400000);
+  const scheduledThisWeek = all.filter(
+    (c) => c.plannedStart && c.plannedStart >= now && c.plannedStart <= weekFromNow,
+  ).length;
+  const emergencyOpen = all.filter((c) => c.track === "emergency" && OPEN_STATUSES.includes(c.status)).length;
+  const completed = all.filter((c) => c.status === "completed");
+  const successful = completed.length;
+  const total = all.filter((c) => c.status === "completed" || c.status === "rejected" || c.status === "rolled_back").length;
+  const successRate = total > 0 ? Math.round((successful / total) * 100) : 0;
+
+  const byStatus: Record<string, number> = {};
+  const byTrack: Record<string, number> = { normal: 0, standard: 0, emergency: 0 };
+  const byRisk: Record<string, number> = { low: 0, medium: 0, high: 0 };
+  for (const c of all) {
+    byStatus[c.status] = (byStatus[c.status] ?? 0) + 1;
+    byTrack[c.track] = (byTrack[c.track] ?? 0) + 1;
+    byRisk[c.risk] = (byRisk[c.risk] ?? 0) + 1;
+  }
+  res.json({
+    totalChanges,
+    openChanges,
+    awaitingApproval,
+    scheduledThisWeek,
+    emergencyOpen,
+    successRate,
+    byStatus: Object.entries(byStatus).map(([key, count]) => ({ key, count })),
+    byTrack: Object.entries(byTrack).map(([key, count]) => ({ key, count })),
+    byRisk: Object.entries(byRisk).map(([key, count]) => ({ key, count })),
+  });
+});
+
+router.get("/dashboard/statistics.pdf", requireAuth, async (req, res): Promise<void> => {
+  const rangeKey = typeof req.query.range === "string" ? req.query.range : undefined;
+  const range = resolveRange(rangeKey);
+  const allRaw = (await db.select().from(changeRequestsTable)).filter((c) => !c.deletedAt);
+  const rows = range ? allRaw.filter((c) => c.createdAt >= range.start && c.createdAt <= range.end) : allRaw;
+  const byStatus = new Map<string, number>();
+  const byTrack = new Map<string, number>();
+  const byRisk = new Map<string, number>();
+  for (const c of rows) {
+    byStatus.set(c.status, (byStatus.get(c.status) ?? 0) + 1);
+    byTrack.set(c.track, (byTrack.get(c.track) ?? 0) + 1);
+    byRisk.set(c.risk, (byRisk.get(c.risk) ?? 0) + 1);
+  }
+  const completed = rows.filter((c) => c.status === "completed").length;
+  const concluded = rows.filter((c) => ["completed", "rejected", "rolled_back"].includes(c.status)).length;
+  const stats = [
+    ["Total changes", rows.length],
+    ["Open changes", rows.filter((c) => OPEN_STATUSES.includes(c.status)).length],
+    ["Awaiting approval", rows.filter((c) => c.status === "awaiting_approval" || c.status === "in_review").length],
+    ["Emergency open", rows.filter((c) => c.track === "emergency" && OPEN_STATUSES.includes(c.status)).length],
+    ["Success rate", `${concluded ? Math.round((completed / concluded) * 100) : 0}%`],
+  ] as const;
+
+  const doc = new PDFDocument({ size: "A4", margins: { top: 48, bottom: 48, left: 48, right: 48 } });
+  const chunks: Buffer[] = [];
+  doc.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const done = new Promise<Buffer>((resolve) => doc.on("end", () => resolve(Buffer.concat(chunks))));
+  doc.font("Helvetica-Bold").fontSize(20).fillColor("#111827").text("Change-it — Dashboard statistics");
+  doc.moveDown(0.3).font("Helvetica").fontSize(9).fillColor("#6b7280").text(
+    range
+      ? `Created ${range.start.toLocaleDateString("en-GB")} – ${range.end.toLocaleDateString("en-GB")}`
+      : "All-time statistics",
+  );
+  doc.moveDown(1);
+  for (const [label, value] of stats) {
+    doc.font("Helvetica-Bold").fontSize(10).fillColor("#374151").text(label, { continued: true, width: 220 });
+    doc.font("Helvetica").fillColor("#111827").text(String(value));
+  }
+  const section = (title: string, values: Map<string, number>) => {
+    doc.moveDown(0.8).font("Helvetica-Bold").fontSize(13).fillColor("#111827").text(title);
+    doc.moveDown(0.25);
+    for (const [key, count] of [...values].sort((a, b) => b[1] - a[1])) {
+      doc.font("Helvetica").fontSize(9).fillColor("#374151").text(`${key.replace(/_/g, " ")}: ${count}`);
+    }
+  };
+  section("By status", byStatus);
+  section("By track", byTrack);
+  section("By risk", byRisk);
+  doc.moveDown(1).fontSize(8).fillColor("#9ca3af").text(`Generated ${new Date().toLocaleString("en-GB")}`);
+  doc.end();
+  const pdf = await done;
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="dashboard-statistics-${new Date().toISOString().slice(0, 10)}.pdf"`);
+  res.send(pdf);
+});
+
+router.get("/dashboard/activity", requireAdmin, async (_req, res): Promise<void> => {
+  const rows = await db.select().from(auditLogTable).orderBy(desc(auditLogTable.timestamp)).limit(20);
+  res.json(
+    rows.map((r) => ({
+      id: r.id,
+      timestamp: r.timestamp,
+      actorName: r.actorName,
+      action: r.action,
+      entityType: r.entityType,
+      entityId: r.entityId,
+      summary: r.summary,
+    })),
+  );
+});
+
+router.get("/dashboard/upcoming-cab", requireAuth, async (_req, res): Promise<void> => {
+  const rows = await db
+    .select()
+    .from(cabMeetingsTable)
+    .where(gte(cabMeetingsTable.scheduledStart, new Date()))
+    .orderBy(cabMeetingsTable.scheduledStart)
+    .limit(10);
+  res.json(
+    rows.map((m) => ({
+      id: m.id,
+      title: m.title,
+      kind: m.kind,
+      scheduledStart: m.scheduledStart,
+      scheduledEnd: m.scheduledEnd,
+      location: m.location,
+    })),
+  );
+});
+
+router.get("/dashboard/my-tasks", requireAuth, async (req, res): Promise<void> => {
+  const session = req.session!;
+  const tasks: Array<{ kind: string; changeId: number; ref: string; title: string; due?: Date | null; note?: string }> = [];
+
+  // Pending approvals where I'm in the role (or deputy)
+  const myAssignments = await db
+    .select()
+    .from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.userId, session.uid));
+  const myRoles = Array.from(new Set(myAssignments.map((a) => a.roleKey)));
+
+  // Change managers (and admins) review incoming changes: everything sitting
+  // in submitted / in_review is waiting on them to either send it to approval
+  // or reject it.
+  if (session.isAdmin || myRoles.includes("change_manager")) {
+    const toReview = await db
+      .select()
+      .from(changeRequestsTable)
+      .where(
+        and(
+          inArray(changeRequestsTable.status, ["submitted", "in_review"]),
+          isNull(changeRequestsTable.deletedAt),
+        ),
+      );
+    for (const c of toReview) {
+      tasks.push({
+        kind: "review",
+        changeId: c.id,
+        ref: c.ref,
+        title: c.title,
+        note: c.status === "submitted" ? "Submitted — review required" : "In review — send to approval or reject",
+      });
+    }
+  }
+
+  if (myAssignments.length > 0) {
+    const pending = await db
+      .select({
+        approvalId: approvalsTable.id,
+        roleKey: approvalsTable.roleKey,
+        changeId: approvalsTable.changeId,
+        ref: changeRequestsTable.ref,
+        title: changeRequestsTable.title,
+      })
+      .from(approvalsTable)
+      .innerJoin(changeRequestsTable, eq(changeRequestsTable.id, approvalsTable.changeId))
+      .where(
+        and(
+          eq(approvalsTable.decision, "pending"),
+          inArray(approvalsTable.roleKey, myRoles),
+          isNull(changeRequestsTable.deletedAt),
+          // A pending approval row is only an actionable task while the
+          // change is actually awaiting approval. Approval rows are created
+          // at draft time, and sibling rows stay "pending" after a rejection
+          // flips the change — neither should surface as a task.
+          eq(changeRequestsTable.status, "awaiting_approval"),
+        ),
+      );
+    for (const p of pending) {
+      tasks.push({
+        kind: "approval",
+        changeId: p.changeId,
+        ref: p.ref,
+        title: p.title,
+        note: `Pending ${p.roleKey} approval`,
+      });
+    }
+  }
+
+  // Changes I own that need testing/PIR
+  const myChanges = await db
+    .select()
+    .from(changeRequestsTable)
+    .where(
+      and(
+        or(eq(changeRequestsTable.ownerId, session.uid), eq(changeRequestsTable.assigneeId, session.uid)),
+        isNull(changeRequestsTable.deletedAt),
+      ),
+    );
+  for (const c of myChanges) {
+    if (c.status === "in_testing" || (c.status === "implemented" && c.track !== "standard")) {
+      const [t] = await db
+        .select()
+        .from(testRecordsTable)
+        .where(and(eq(testRecordsTable.changeId, c.id), eq(testRecordsTable.kind, "production")));
+      if (!t || t.overallResult === "pending") {
+        tasks.push({ kind: "testing", changeId: c.id, ref: c.ref, title: c.title, note: "Testing pending" });
+      }
+    }
+    if (c.status === "completed" || c.status === "awaiting_pir") {
+      const [p] = await db.select().from(pirRecordsTable).where(eq(pirRecordsTable.changeId, c.id));
+      if (!p || !p.completedAt) {
+        tasks.push({ kind: "pir", changeId: c.id, ref: c.ref, title: c.title, note: "PIR due" });
+      }
+    }
+  }
+
+  // Changes where I'm the per-change Implementer or Tester (change_assignees),
+  // surfaced in the statuses where that role is expected to act.
+  const perChange = await db
+    .select({
+      roleKey: changeAssigneesTable.roleKey,
+      change: changeRequestsTable,
+    })
+    .from(changeAssigneesTable)
+    .innerJoin(changeRequestsTable, eq(changeRequestsTable.id, changeAssigneesTable.changeId))
+    .where(and(eq(changeAssigneesTable.userId, session.uid), isNull(changeRequestsTable.deletedAt)));
+  const IMPLEMENTER_STATUS_NOTES: Record<string, string> = {
+    approved: "Approved — schedule or start pre-prod testing",
+    in_preprod_testing: "Pre-prod testing in progress",
+    scheduled: "Scheduled — implementation upcoming",
+    awaiting_implementation: "Awaiting implementation",
+    in_progress: "Implementation in progress",
+  };
+  for (const { roleKey, change: c } of perChange) {
+    if (roleKey === "implementer") {
+      const note = IMPLEMENTER_STATUS_NOTES[c.status];
+      if (note) {
+        tasks.push({ kind: "implementation", changeId: c.id, ref: c.ref, title: c.title, note });
+      }
+    } else if (roleKey === "tester") {
+      if (c.status === "in_testing" || (c.status === "implemented" && c.track !== "standard")) {
+        // Same pending-test check as the owner/assignee branch above.
+        const [t] = await db
+          .select()
+          .from(testRecordsTable)
+          .where(and(eq(testRecordsTable.changeId, c.id), eq(testRecordsTable.kind, "production")));
+        if (!t || t.overallResult === "pending") {
+          // Avoid a duplicate row when the tester is also the owner/assignee.
+          if (!tasks.some((task) => task.kind === "testing" && task.changeId === c.id)) {
+            tasks.push({ kind: "testing", changeId: c.id, ref: c.ref, title: c.title, note: "Testing pending" });
+          }
+        }
+      }
+    }
+  }
+  // Cap the list at 20, but rank by actionability first so a big review
+  // backlog (change managers) can't starve approval/testing/PIR tasks.
+  const KIND_PRIORITY: Record<string, number> = { approval: 0, testing: 1, pir: 2, implementation: 3, review: 4 };
+  tasks.sort(
+    (a, b) => (KIND_PRIORITY[a.kind] ?? 99) - (KIND_PRIORITY[b.kind] ?? 99) || a.changeId - b.changeId,
+  );
+  res.json(tasks.slice(0, 20));
+});
+
+export default router;

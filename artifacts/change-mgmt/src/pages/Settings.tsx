@@ -1,0 +1,1955 @@
+import { useEffect, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertTriangle, CheckCircle2, Copy, Download, FileSignature, Loader2, Save, Trash2, Upload, XCircle } from "lucide-react";
+import { toast } from "sonner";
+import { api } from "@/lib/api";
+import { fmtDate, fmtDateTime } from "@/lib/format";
+import type { CategoryItem, LdapSettings, LdapTestResult, PentestTestType, SdpSettings, SmtpSettings, SslSettings } from "@/lib/types";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+type CsrResponse = {
+  csrPem: string;
+  publicKeyFingerprintSha256: string;
+  subject: {
+    commonName: string;
+    organization?: string;
+    organizationalUnit?: string;
+    locality?: string;
+    state?: string;
+    country?: string;
+    emailAddress?: string;
+  };
+  subjectAltNames: string[];
+  keyBits: number;
+};
+
+export function SettingsPage() {
+  return (
+    <div className="space-y-4" data-testid="page-settings">
+      <div>
+        <h2 className="text-2xl font-semibold tracking-tight">System settings</h2>
+        <p className="text-sm text-muted-foreground">Administrator-only configuration for SMTP, LDAP, SSL, and more.</p>
+      </div>
+      <Tabs defaultValue="smtp">
+        <TabsList>
+          <TabsTrigger value="smtp" data-testid="tab-smtp">SMTP</TabsTrigger>
+          <TabsTrigger value="ldap" data-testid="tab-ldap">LDAP</TabsTrigger>
+          <TabsTrigger value="ssl" data-testid="tab-ssl">SSL/TLS</TabsTrigger>
+          <TabsTrigger value="notifications" data-testid="tab-notifications">Notifications</TabsTrigger>
+          <TabsTrigger value="categories" data-testid="tab-categories">Categories</TabsTrigger>
+          <TabsTrigger value="pentest-types" data-testid="tab-pentest-types">PenTest types</TabsTrigger>
+          <TabsTrigger value="sdp" data-testid="tab-sdp">ServiceDesk+</TabsTrigger>
+          <TabsTrigger value="backup" data-testid="tab-backup">Backup &amp; Restore</TabsTrigger>
+        </TabsList>
+        <TabsContent value="smtp"><SmtpPanel /></TabsContent>
+        <TabsContent value="ldap"><LdapPanel /></TabsContent>
+        <TabsContent value="ssl"><SslPanel /></TabsContent>
+        <TabsContent value="notifications"><NotificationsBatchPanel /></TabsContent>
+        <TabsContent value="categories"><CategoriesPanel /></TabsContent>
+        <TabsContent value="pentest-types"><PentestTypesPanel /></TabsContent>
+        <TabsContent value="sdp"><SdpPanel /></TabsContent>
+        <TabsContent value="backup"><BackupPanel /></TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
+function SdpPanel() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["settings.sdp"], queryFn: () => api.get<SdpSettings>("/settings/sdp") });
+  const [form, setForm] = useState<(SdpSettings & { technicianKey: string }) | null>(null);
+  useEffect(() => {
+    if (q.data && !form) setForm({ ...q.data, technicianKey: "" });
+  }, [q.data, form]);
+  const save = useMutation({
+    mutationFn: () => api.put<SdpSettings>("/settings/sdp", form),
+    onSuccess: (row) => {
+      toast.success("ServiceDesk+ settings saved");
+      setForm({ ...row, technicianKey: "" });
+      qc.invalidateQueries({ queryKey: ["settings.sdp"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+  });
+  const test = useMutation({
+    mutationFn: () => api.post<{ success: boolean; message: string }>("/settings/sdp/test", {}),
+    onSuccess: (r) => (r.success ? toast.success(r.message) : toast.error(r.message)),
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Test failed"),
+  });
+  const rotate = useMutation({
+    mutationFn: () => api.post<SdpSettings>("/settings/sdp/rotate-secret", {}),
+    onSuccess: (row) => {
+      toast.success("Webhook secret rotated — update the SD+ custom trigger");
+      setForm({ ...row, technicianKey: "" });
+      qc.invalidateQueries({ queryKey: ["settings.sdp"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Rotation failed"),
+  });
+  if (!form) return <Skeleton className="mt-4 h-72 w-full" />;
+  const webhookUrl = `${window.location.origin}/api/integrations/sdp/create-change`;
+  const curlExample = `curl -X POST "${webhookUrl}" \\\n  -H "Content-Type: application/json" \\\n  -H "X-Webhook-Secret: ${form.webhookSecret || "<secret>"}" \\\n  -d '{"request_id": "1234", "subject": "Test RFC", "description": "Test from curl", "technician_email": "tech@example.org", "change_type": "normal"}'`;
+  return (
+    <div className="mt-4 space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">ManageEngine ServiceDesk Plus (on-premises)</CardTitle>
+          <CardDescription>
+            A technician opens a change from an RFC ticket via a custom trigger in SD+. When the change completes
+            or is rejected here, the SD+ request is automatically set to Resolved or Rejected with the full change
+            history in the resolution field.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center gap-3">
+            <Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} data-testid="switch-sdp-enabled" />
+            <Label>Integration enabled</Label>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label>SD+ base URL</Label>
+              <Input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://sdp.chdn.lu:8080" data-testid="input-sdp-baseurl" />
+            </div>
+            <div className="space-y-2">
+              <Label>Technician API key {form.technicianKeySet && <span className="text-xs text-muted-foreground">(saved — leave blank to keep)</span>}</Label>
+              <Input type="password" value={form.technicianKey} onChange={(e) => setForm({ ...form, technicianKey: e.target.value })} placeholder={form.technicianKeySet ? "••••••••" : "Technician key from SD+ admin"} data-testid="input-sdp-key" />
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Label>Status set on change creation</Label>
+            <Input value={form.onCreateStatusName} onChange={(e) => setForm({ ...form, onCreateStatusName: e.target.value })} placeholder="Waiting for Change-it" data-testid="input-sdp-oncreate-status" />
+            <p className="text-xs text-muted-foreground">
+              When a change is created from an SD+ ticket, the ticket's status is set to this value. The status must
+              exist in SD+ (Admin → Helpdesk Customizer → Request Status) with the exact same name. Leave empty to disable.
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <Switch checked={!form.tlsRejectUnauthorized} onCheckedChange={(v) => setForm({ ...form, tlsRejectUnauthorized: !v })} data-testid="switch-sdp-tls" />
+            <div>
+              <Label>Allow self-signed certificate</Label>
+              <p className="text-xs text-muted-foreground">Skip TLS verification for internal SD+ servers with self-signed certificates.</p>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => save.mutate()} disabled={save.isPending} data-testid="button-sdp-save">
+              {save.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}Save
+            </Button>
+            <Button variant="outline" onClick={() => test.mutate()} disabled={test.isPending} data-testid="button-sdp-test">
+              {test.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <CheckCircle2 className="mr-2 h-4 w-4" />}Test connection
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Inbound webhook (SD+ → Change-it)</CardTitle>
+          <CardDescription>
+            Configure a Custom Trigger in SD+ (Admin → Custom Triggers → Requests) with a webhook action calling the
+            URL below, executed manually via a &quot;Create Change&quot; button on the request.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <Label>Webhook URL</Label>
+            <div className="flex gap-2">
+              <Input readOnly value={webhookUrl} className="font-mono text-xs" data-testid="input-sdp-webhook-url" />
+              <Button variant="outline" size="icon" onClick={() => { navigator.clipboard.writeText(webhookUrl); toast.success("Copied"); }}><Copy className="h-4 w-4" /></Button>
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Label>Webhook secret (send as X-Webhook-Secret header)</Label>
+            <div className="flex gap-2">
+              <Input readOnly value={form.webhookSecret || "(save settings once to generate)"} className="font-mono text-xs" data-testid="input-sdp-webhook-secret" />
+              <Button variant="outline" size="icon" onClick={() => { navigator.clipboard.writeText(form.webhookSecret); toast.success("Copied"); }} disabled={!form.webhookSecret}><Copy className="h-4 w-4" /></Button>
+              <Button variant="outline" onClick={() => rotate.mutate()} disabled={rotate.isPending} data-testid="button-sdp-rotate">Rotate</Button>
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Label>Test from a terminal (any machine that can reach this server)</Label>
+            <Textarea readOnly rows={5} value={curlExample} className="font-mono text-xs" data-testid="text-sdp-curl" />
+          </div>
+          <Alert>
+            <AlertDescription data-testid="text-sdp-last-webhook">
+              {form.lastWebhookAt ? (
+                <>Last webhook received {fmtDateTime(form.lastWebhookAt)} — request #{form.lastWebhookRequestId ?? "?"} — {form.lastWebhookStatus ?? ""}</>
+              ) : (
+                <>No webhook received yet. Expected JSON body: request_id, subject, description, requester_name, technician_email, change_type (normal | standard | emergency), template (optional name for standard — if omitted, the template is chosen in the draft here).</>
+              )}
+            </AlertDescription>
+          </Alert>
+          <Button variant="ghost" size="sm" onClick={() => qc.invalidateQueries({ queryKey: ["settings.sdp"] }).then(() => setForm(null))} data-testid="button-sdp-refresh">Refresh status</Button>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function SmtpPanel() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["settings.smtp"], queryFn: () => api.get<SmtpSettings>("/settings/smtp") });
+  const [form, setForm] = useState<(SmtpSettings & { password: string; caCertPem?: string }) | null>(null);
+  useEffect(() => {
+    if (q.data && !form) setForm({ ...q.data, password: "", caCertPem: "" });
+  }, [q.data, form]);
+  const save = useMutation({
+    mutationFn: () => api.put<SmtpSettings>("/settings/smtp", form),
+    onSuccess: (row) => {
+      toast.success("SMTP settings saved");
+      setForm({ ...row, password: "", caCertPem: "" });
+      qc.invalidateQueries({ queryKey: ["settings.smtp"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+  });
+  const [testTo, setTestTo] = useState("");
+  const test = useMutation({
+    mutationFn: () => api.post<{ success: boolean; message: string }>("/settings/smtp/test", { to: testTo }),
+    onSuccess: (r) => (r.success ? toast.success(r.message) : toast.error(r.message)),
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Test failed"),
+  });
+  if (!form) return <Skeleton className="mt-4 h-72 w-full" />;
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="text-base">SMTP server</CardTitle>
+        <CardDescription>Outgoing mail for notifications and CAB invitations.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-3">
+          <div className="space-y-2 md:col-span-2">
+            <Label>Host</Label>
+            <Input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="smtp.example.com" data-testid="input-smtp-host" />
+          </div>
+          <div className="space-y-2">
+            <Label>Port</Label>
+            <Input type="number" value={form.port} onChange={(e) => setForm({ ...form, port: Number(e.target.value) })} data-testid="input-smtp-port" />
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label>Username</Label>
+            <Input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} />
+          </div>
+          <div className="space-y-2">
+            <Label>{form.passwordSet ? "Password (leave blank to keep)" : "Password"}</Label>
+            <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} data-testid="input-smtp-password" />
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label>From address</Label>
+            <Input type="email" value={form.fromAddress} onChange={(e) => setForm({ ...form, fromAddress: e.target.value })} />
+          </div>
+          <div className="space-y-2">
+            <Label>From name</Label>
+            <Input value={form.fromName} onChange={(e) => setForm({ ...form, fromName: e.target.value })} />
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="flex items-center justify-between rounded-md border border-border p-3">
+            <Label>Use SSL/TLS (port 465)</Label>
+            <Switch checked={form.secure} onCheckedChange={(v) => setForm({ ...form, secure: v })} />
+          </div>
+          <div className="flex items-center justify-between rounded-md border border-border p-3">
+            <Label>Enabled</Label>
+            <Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} data-testid="switch-smtp-enabled" />
+          </div>
+        </div>
+        <div className="space-y-2 rounded-md border border-border p-3">
+          <div className="flex items-center justify-between">
+            <Label>Verify TLS certificate</Label>
+            <Switch
+              checked={form.tlsRejectUnauthorized}
+              onCheckedChange={(v) => setForm({ ...form, tlsRejectUnauthorized: v })}
+              data-testid="switch-smtp-tls-verify"
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            On (recommended) the server certificate must be valid. Turn OFF only for self-signed
+            mail relays you control — encryption is preserved but the server is no longer authenticated.
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label>Custom CA certificate (PEM){form.caCertInstalled && <span className="ml-2 text-xs text-success">Installed</span>}</Label>
+          <Textarea
+            rows={4}
+            value={form.caCertPem ?? ""}
+            onChange={(e) => setForm({ ...form, caCertPem: e.target.value })}
+            placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+            data-testid="textarea-smtp-ca"
+          />
+          <p className="text-xs text-muted-foreground">
+            Paste a PEM CA chain to trust internal mail relays without disabling verification.
+          </p>
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-border pt-4">
+          <Button onClick={() => save.mutate()} disabled={save.isPending} data-testid="button-save-smtp">
+            {save.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            <Save className="mr-2 h-4 w-4" /> Save
+          </Button>
+        </div>
+        <div className="rounded-md border border-border bg-muted/30 p-4 space-y-3">
+          <Label>Send a test email</Label>
+          <div className="flex gap-2">
+            <Input placeholder="recipient@example.com" value={testTo} onChange={(e) => setTestTo(e.target.value)} data-testid="input-smtp-test-to" />
+            <Button variant="outline" onClick={() => test.mutate()} disabled={test.isPending || !testTo} data-testid="button-smtp-test">
+              {test.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Send test
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Quick presets for the most common directory layouts. Clicking one fills
+// the user-filter and username-attribute together so admins don't have to
+// remember which AD attribute matches which schema.
+const LDAP_PRESETS: Array<{
+  id: string;
+  label: string;
+  hint: string;
+  userFilter: string;
+  usernameAttr: string;
+  emailAttr: string;
+  nameAttr: string;
+}> = [
+  {
+    id: "openldap",
+    label: "OpenLDAP / posixAccount",
+    hint: "Login is the short uid (e.g. jdoe).",
+    userFilter: "(uid={{username}})",
+    usernameAttr: "uid",
+    emailAttr: "mail",
+    nameAttr: "cn",
+  },
+  {
+    id: "ad-sam",
+    label: "Active Directory (sAMAccountName)",
+    hint: "Login is the pre-Windows-2000 name (e.g. jdoe).",
+    userFilter: "(&(objectClass=user)(sAMAccountName={{username}}))",
+    usernameAttr: "sAMAccountName",
+    emailAttr: "mail",
+    nameAttr: "displayName",
+  },
+  {
+    id: "ad-upn",
+    label: "Active Directory (userPrincipalName)",
+    hint: "Login is the full UPN (e.g. jdoe@corp.local).",
+    userFilter: "(&(objectClass=user)(userPrincipalName={{username}}))",
+    usernameAttr: "userPrincipalName",
+    emailAttr: "mail",
+    nameAttr: "displayName",
+  },
+];
+
+// Friendly label for each phase the bind can fail at — mirrors the LdapStage
+// union on the backend.
+const STAGE_LABEL: Record<LdapTestResult["stage"], string> = {
+  config: "Configuration",
+  connect: "Connection / TLS",
+  "service-bind": "Service account bind",
+  search: "User lookup",
+  "user-bind": "User password bind",
+  ok: "Success",
+};
+
+function LdapPanel() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["settings.ldap"], queryFn: () => api.get<LdapSettings>("/settings/ldap") });
+  const [form, setForm] = useState<
+    (LdapSettings & { bindPassword: string; caCertPem?: string; issuerCertPem?: string }) | null
+  >(null);
+  useEffect(() => {
+    if (q.data && !form) setForm({ ...q.data, bindPassword: "", caCertPem: "", issuerCertPem: "" });
+  }, [q.data, form]);
+  const save = useMutation({
+    mutationFn: () => api.put<LdapSettings>("/settings/ldap", form),
+    onSuccess: (row) => {
+      toast.success("LDAP settings saved");
+      setForm({ ...row, bindPassword: "", caCertPem: "", issuerCertPem: "" });
+      qc.invalidateQueries({ queryKey: ["settings.ldap"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+  });
+  const [testUser, setTestUser] = useState("");
+  const [testPass, setTestPass] = useState("");
+  // Persist the most recent diagnostic so admins can keep the failure
+  // details on screen while editing the form to fix them.
+  const [lastResult, setLastResult] = useState<LdapTestResult | null>(null);
+  const test = useMutation({
+    mutationFn: () => api.post<LdapTestResult>("/settings/ldap/test", { username: testUser, password: testPass }),
+    onSuccess: (r) => {
+      setLastResult(r);
+      if (r.success) toast.success(r.message);
+      else toast.error(`${STAGE_LABEL[r.stage]}: ${r.message}`);
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : "Test failed";
+      setLastResult({ success: false, stage: "config", message: msg });
+      toast.error(msg);
+    },
+  });
+  if (!form) return <Skeleton className="mt-4 h-72 w-full" />;
+
+  const applyPreset = (id: string) => {
+    const preset = LDAP_PRESETS.find((p) => p.id === id);
+    if (!preset) return;
+    setForm({
+      ...form,
+      userFilter: preset.userFilter,
+      usernameAttr: preset.usernameAttr,
+      emailAttr: preset.emailAttr,
+      nameAttr: preset.nameAttr,
+    });
+    toast.success(`Applied preset: ${preset.label}`);
+  };
+
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="text-base">LDAP / Active Directory</CardTitle>
+        <CardDescription>Optional centralized authentication.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex items-center justify-between rounded-md border border-border p-3">
+          <Label>Enabled</Label>
+          <Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} data-testid="switch-ldap-enabled" />
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-2 md:col-span-2">
+            <Label>URL</Label>
+            <Input value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} placeholder="ldaps://dc01.corp.local:636" data-testid="input-ldap-url" />
+            <p className="text-xs text-muted-foreground">
+              Use <code>ldaps://</code> on port 636 for AD over TLS, or <code>ldap://</code> on 389 + StartTLS.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label>Bind DN</Label>
+            <Input
+              value={form.bindDn}
+              onChange={(e) => setForm({ ...form, bindDn: e.target.value })}
+              placeholder="cn=svc-changemgmt,ou=Service Accounts,dc=corp,dc=local"
+              data-testid="input-ldap-bind-dn"
+            />
+            <p className="text-xs text-muted-foreground">
+              Service account used to look up users. AD also accepts the UPN form (e.g. <code>svc-changemgmt@corp.local</code>).
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label>{form.bindPasswordSet ? "Bind password (leave blank to keep)" : "Bind password"}</Label>
+            <Input
+              type="password"
+              value={form.bindPassword}
+              onChange={(e) => setForm({ ...form, bindPassword: e.target.value })}
+              data-testid="input-ldap-bind-password"
+            />
+          </div>
+          <div className="space-y-2 md:col-span-2">
+            <Label>Base DN</Label>
+            <Input
+              value={form.baseDn}
+              onChange={(e) => setForm({ ...form, baseDn: e.target.value })}
+              placeholder="dc=corp,dc=local"
+              data-testid="input-ldap-base-dn"
+            />
+            <p className="text-xs text-muted-foreground">
+              Where the user lookup begins. For AD this is usually the domain root, e.g. <code>dc=corp,dc=local</code>.
+            </p>
+          </div>
+          <div className="space-y-2 md:col-span-2">
+            <Label>User filter</Label>
+            <Input
+              value={form.userFilter}
+              onChange={(e) => setForm({ ...form, userFilter: e.target.value })}
+              placeholder="(&(objectClass=user)(sAMAccountName={{username}}))"
+              data-testid="input-ldap-user-filter"
+            />
+            <p className="text-xs text-muted-foreground">
+              An LDAP search filter the server runs under <em>Base DN</em> to find the account that's logging in.
+              The literal token <code>{`{{username}}`}</code> is replaced with whatever the user typed in the
+              login form before the search runs. The first matching entry's DN is then used for the password bind.
+            </p>
+            <div className="flex flex-wrap gap-2 pt-1">
+              <span className="self-center text-xs text-muted-foreground">Quick presets:</span>
+              {LDAP_PRESETS.map((p) => (
+                <Button
+                  key={p.id}
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => applyPreset(p.id)}
+                  title={p.hint}
+                  data-testid={`button-ldap-preset-${p.id}`}
+                >
+                  {p.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Label>Username attribute</Label>
+            <Input
+              value={form.usernameAttr}
+              onChange={(e) => setForm({ ...form, usernameAttr: e.target.value })}
+              data-testid="input-ldap-username-attr"
+            />
+            <p className="text-xs text-muted-foreground">
+              Attribute to read for the local username. AD: <code>sAMAccountName</code> or <code>userPrincipalName</code>; OpenLDAP: <code>uid</code>.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label>Email attribute</Label>
+            <Input value={form.emailAttr} onChange={(e) => setForm({ ...form, emailAttr: e.target.value })} />
+            <p className="text-xs text-muted-foreground">AD: <code>mail</code>. OpenLDAP: <code>mail</code>.</p>
+          </div>
+          <div className="space-y-2">
+            <Label>Display name attribute</Label>
+            <Input value={form.nameAttr} onChange={(e) => setForm({ ...form, nameAttr: e.target.value })} />
+            <p className="text-xs text-muted-foreground">AD: <code>displayName</code> (or <code>cn</code>). OpenLDAP: <code>cn</code>.</p>
+          </div>
+          <div className="flex items-center justify-between rounded-md border border-border p-3">
+            <Label>StartTLS</Label>
+            <Switch checked={form.tls} onCheckedChange={(v) => setForm({ ...form, tls: v })} />
+          </div>
+          <div className="md:col-span-2 space-y-2 rounded-md border border-border p-3">
+            <div className="flex items-center justify-between">
+              <Label>Verify TLS certificate</Label>
+              <Switch
+                checked={form.tlsRejectUnauthorized}
+                onCheckedChange={(v) => setForm({ ...form, tlsRejectUnauthorized: v })}
+                data-testid="switch-ldap-tls-verify"
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              On (recommended) the server certificate must be valid and its name must match the URL hostname.
+              Turn OFF only if your directory uses a self-signed cert, an internal CA Node doesn't trust, or
+              you connect by IP address. With verification disabled the connection is still encrypted but
+              <strong> no longer authenticated</strong> — an attacker who can intercept traffic to the
+              directory can impersonate it.
+            </p>
+          </div>
+        </div>
+        <div className="space-y-3 rounded-md border border-border p-3">
+          <div className="space-y-2">
+            <Label>Trusted CA certificate (PEM){form.caCertInstalled && <span className="ml-2 text-xs text-success">Installed</span>}</Label>
+            <Textarea
+              rows={4}
+              value={form.caCertPem ?? ""}
+              onChange={(e) => setForm({ ...form, caCertPem: e.target.value })}
+              placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+              data-testid="textarea-ldap-ca"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label>Intermediate / issuer certificate (PEM, optional){form.issuerCertInstalled && <span className="ml-2 text-xs text-success">Installed</span>}</Label>
+            <Textarea
+              rows={4}
+              value={form.issuerCertPem ?? ""}
+              onChange={(e) => setForm({ ...form, issuerCertPem: e.target.value })}
+              placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+              data-testid="textarea-ldap-issuer"
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Paste your enterprise root CA (and optionally the issuer chain) to trust internal AD/OpenLDAP
+            certificates without turning off TLS verification.
+          </p>
+        </div>
+        <div className="flex justify-end gap-2 border-t border-border pt-4">
+          <Button onClick={() => save.mutate()} disabled={save.isPending} data-testid="button-save-ldap">
+            {save.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            <Save className="mr-2 h-4 w-4" /> Save
+          </Button>
+        </div>
+        <div className="rounded-md border border-border bg-muted/30 p-4 space-y-3">
+          <div className="space-y-1">
+            <Label>Test bind</Label>
+            <p className="text-xs text-muted-foreground">
+              Run a real bind against the directory using the saved settings. Save the form first
+              if you've just made changes — the test uses the stored values, not the form draft.
+            </p>
+          </div>
+          <div className="grid gap-2 md:grid-cols-3">
+            <Input
+              placeholder="username"
+              value={testUser}
+              onChange={(e) => setTestUser(e.target.value)}
+              data-testid="input-ldap-test-username"
+            />
+            <Input
+              type="password"
+              placeholder="password"
+              value={testPass}
+              onChange={(e) => setTestPass(e.target.value)}
+              data-testid="input-ldap-test-password"
+            />
+            <Button
+              variant="outline"
+              onClick={() => test.mutate()}
+              disabled={test.isPending || !testUser || !testPass}
+              data-testid="button-ldap-test"
+            >
+              {test.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Test
+            </Button>
+          </div>
+          {lastResult && (
+            <div
+              className={
+                "rounded-md border p-3 text-sm " +
+                (lastResult.success
+                  ? "border-emerald-500/40 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300"
+                  : "border-destructive/40 bg-destructive/5 text-destructive")
+              }
+              data-testid="ldap-test-result"
+            >
+              <div className="flex items-center gap-2 font-medium">
+                {lastResult.success ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+                {lastResult.success
+                  ? "Bind succeeded"
+                  : `Failed at: ${STAGE_LABEL[lastResult.stage]}`}
+              </div>
+              <p className="mt-1 text-foreground/90">{lastResult.message}</p>
+              <dl className="mt-2 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-[max-content_1fr]">
+                {lastResult.code && (
+                  <>
+                    <dt className="font-medium">LDAP code:</dt>
+                    <dd><code>{lastResult.code}</code></dd>
+                  </>
+                )}
+                {lastResult.userDn && (
+                  <>
+                    <dt className="font-medium">User DN:</dt>
+                    <dd className="break-all"><code>{lastResult.userDn}</code></dd>
+                  </>
+                )}
+                {lastResult.details && (
+                  <>
+                    <dt className="font-medium">Server message:</dt>
+                    <dd className="break-words whitespace-pre-wrap"><code>{lastResult.details}</code></dd>
+                  </>
+                )}
+              </dl>
+              {!lastResult.success && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Full structured logs (with the masked username, base DN and stage) are written to the API
+                  server's log stream — check <code>docker compose logs api</code> on the host.
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function SslPanel() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["settings.ssl"], queryFn: () => api.get<SslSettings>("/settings/ssl") });
+  const [certificatePem, setCertificatePem] = useState("");
+  const [privateKeyPem, setPrivateKeyPem] = useState("");
+  const [chainPem, setChainPem] = useState("");
+  const [forceHttps, setForceHttps] = useState(false);
+  const [hstsEnabled, setHstsEnabled] = useState(false);
+  useEffect(() => {
+    if (q.data) {
+      setForceHttps(q.data.forceHttps);
+      setHstsEnabled(q.data.hstsEnabled);
+    }
+  }, [q.data]);
+  const save = useMutation({
+    mutationFn: () =>
+      api.put<SslSettings>("/settings/ssl", {
+        certificatePem: certificatePem || undefined,
+        privateKeyPem: privateKeyPem || undefined,
+        chainPem: chainPem || undefined,
+        forceHttps,
+        hstsEnabled,
+      }),
+    onSuccess: () => {
+      toast.success("SSL settings saved. Restart the server for cert changes to take effect.");
+      setCertificatePem("");
+      setPrivateKeyPem("");
+      setChainPem("");
+      qc.invalidateQueries({ queryKey: ["settings.ssl"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+  });
+  const ssl = q.data;
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="text-base">SSL/TLS certificate</CardTitle>
+        <CardDescription>Bring-your-own PEM certificates for HTTPS.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <Alert>
+          <AlertDescription>
+            Current state — Certificate: <strong>{ssl?.certificateInstalled ? "installed" : "not set"}</strong>;
+            Private key: <strong>{ssl?.privateKeyInstalled ? "installed" : "not set"}</strong>;
+            Chain: <strong>{ssl?.chainInstalled ? "installed" : "not set"}</strong>.
+          </AlertDescription>
+        </Alert>
+        <div className="space-y-2">
+          <Label>Certificate (PEM)</Label>
+          <Textarea rows={5} placeholder="-----BEGIN CERTIFICATE-----…" value={certificatePem} onChange={(e) => setCertificatePem(e.target.value)} data-testid="textarea-cert" />
+        </div>
+        <div className="space-y-2">
+          <Label>Private key (PEM)</Label>
+          <Textarea rows={5} placeholder="-----BEGIN PRIVATE KEY-----…" value={privateKeyPem} onChange={(e) => setPrivateKeyPem(e.target.value)} data-testid="textarea-key" />
+        </div>
+        <div className="space-y-2">
+          <Label>Chain / intermediate (PEM, optional)</Label>
+          <Textarea rows={4} placeholder="-----BEGIN CERTIFICATE-----…" value={chainPem} onChange={(e) => setChainPem(e.target.value)} />
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="flex items-center justify-between rounded-md border border-border p-3">
+            <div>
+              <Label>Force HTTPS</Label>
+              <p className="text-xs text-muted-foreground">Redirect all HTTP requests to HTTPS.</p>
+            </div>
+            <Switch checked={forceHttps} onCheckedChange={setForceHttps} />
+          </div>
+          <div className="flex items-center justify-between rounded-md border border-border p-3">
+            <div>
+              <Label>Enable HSTS</Label>
+              <p className="text-xs text-muted-foreground">HTTP Strict Transport Security header.</p>
+            </div>
+            <Switch checked={hstsEnabled} onCheckedChange={setHstsEnabled} />
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-4">
+          <CsrDialog
+            onGenerated={() => qc.invalidateQueries({ queryKey: ["settings.ssl"] })}
+          />
+          <Button onClick={() => save.mutate()} disabled={save.isPending} data-testid="button-save-ssl">
+            {save.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            <Save className="mr-2 h-4 w-4" /> Save
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function CsrDialog({ onGenerated }: { onGenerated: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [commonName, setCommonName] = useState("");
+  const [organization, setOrganization] = useState("");
+  const [organizationalUnit, setOrganizationalUnit] = useState("");
+  const [locality, setLocality] = useState("");
+  const [stateField, setStateField] = useState("");
+  const [country, setCountry] = useState("");
+  const [emailAddress, setEmailAddress] = useState("");
+  const [sansText, setSansText] = useState("");
+  const [keyBits, setKeyBits] = useState<2048 | 3072 | 4096>(2048);
+  const [result, setResult] = useState<CsrResponse | null>(null);
+
+  const reset = () => {
+    setCommonName("");
+    setOrganization("");
+    setOrganizationalUnit("");
+    setLocality("");
+    setStateField("");
+    setCountry("");
+    setEmailAddress("");
+    setSansText("");
+    setKeyBits(2048);
+    setResult(null);
+  };
+
+  const generate = useMutation({
+    mutationFn: () => {
+      const sans = sansText
+        .split(/[\n,]/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return api.post<CsrResponse>("/settings/ssl/csr", {
+        commonName: commonName.trim(),
+        organization: organization.trim() || undefined,
+        organizationalUnit: organizationalUnit.trim() || undefined,
+        locality: locality.trim() || undefined,
+        state: stateField.trim() || undefined,
+        country: country.trim() || undefined,
+        emailAddress: emailAddress.trim() || undefined,
+        subjectAltNames: sans,
+        keyBits,
+      });
+    },
+    onSuccess: (data) => {
+      setResult(data);
+      onGenerated();
+      toast.success("CSR generated. The private key is held on the server until your CA returns the signed certificate.");
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "CSR generation failed"),
+  });
+
+  const copyCsr = async () => {
+    if (!result) return;
+    try {
+      await navigator.clipboard.writeText(result.csrPem);
+      toast.success("CSR copied to clipboard");
+    } catch {
+      toast.error("Clipboard not available");
+    }
+  };
+
+  const downloadCsr = () => {
+    if (!result) return;
+    const blob = new Blob([result.csrPem], { type: "application/pkcs10" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeCn = result.subject.commonName.replace(/[^a-zA-Z0-9._-]/g, "_");
+    a.href = url;
+    a.download = `${safeCn || "request"}.csr`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) reset();
+      }}
+    >
+      <DialogTrigger asChild>
+        <Button variant="outline" data-testid="button-open-csr">
+          <FileSignature className="mr-2 h-4 w-4" /> Generate CSR
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Generate certificate signing request</DialogTitle>
+          <DialogDescription>
+            Create a fresh RSA key pair and a CSR for your internal PKI to sign. The private key is
+            stored on this server; once the CA returns the signed certificate, paste it into the
+            Certificate field above and save.
+          </DialogDescription>
+        </DialogHeader>
+
+        {!result ? (
+          <div className="grid gap-4 py-2 md:grid-cols-2">
+            <div className="space-y-2 md:col-span-2">
+              <Label>Common name (CN) <span className="text-destructive">*</span></Label>
+              <Input
+                value={commonName}
+                onChange={(e) => setCommonName(e.target.value)}
+                placeholder="change-mgmt.example.com"
+                data-testid="input-csr-cn"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Organization (O)</Label>
+              <Input value={organization} onChange={(e) => setOrganization(e.target.value)} placeholder="Acme Corp" />
+            </div>
+            <div className="space-y-2">
+              <Label>Organizational unit (OU)</Label>
+              <Input value={organizationalUnit} onChange={(e) => setOrganizationalUnit(e.target.value)} placeholder="IT Operations" />
+            </div>
+            <div className="space-y-2">
+              <Label>Locality (L)</Label>
+              <Input value={locality} onChange={(e) => setLocality(e.target.value)} placeholder="Berlin" />
+            </div>
+            <div className="space-y-2">
+              <Label>State / province (ST)</Label>
+              <Input value={stateField} onChange={(e) => setStateField(e.target.value)} placeholder="Berlin" />
+            </div>
+            <div className="space-y-2">
+              <Label>Country (C, 2-letter)</Label>
+              <Input
+                value={country}
+                onChange={(e) => setCountry(e.target.value.toUpperCase())}
+                maxLength={2}
+                placeholder="DE"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Email address</Label>
+              <Input value={emailAddress} onChange={(e) => setEmailAddress(e.target.value)} placeholder="pki@example.com" />
+            </div>
+            <div className="space-y-2 md:col-span-2">
+              <Label>Subject alternative names (one per line)</Label>
+              <Textarea
+                rows={3}
+                value={sansText}
+                onChange={(e) => setSansText(e.target.value)}
+                placeholder={"change-mgmt.example.com\nchange-mgmt-internal.example.com\n10.0.1.42"}
+                data-testid="textarea-csr-sans"
+              />
+              <p className="text-xs text-muted-foreground">
+                Hostnames or IP addresses. The common name is added automatically.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label>Key size</Label>
+              <Select value={String(keyBits)} onValueChange={(v) => setKeyBits(Number(v) as 2048 | 3072 | 4096)}>
+                <SelectTrigger data-testid="select-csr-keybits">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="2048">RSA 2048</SelectItem>
+                  <SelectItem value="3072">RSA 3072</SelectItem>
+                  <SelectItem value="4096">RSA 4096</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3 py-2">
+            <Alert>
+              <AlertDescription className="space-y-1 text-xs">
+                <div>
+                  <strong>CN:</strong> {result.subject.commonName}
+                  {result.subject.organization ? ` · O=${result.subject.organization}` : ""}
+                </div>
+                <div>
+                  <strong>SANs:</strong> {result.subjectAltNames.join(", ") || "(none)"}
+                </div>
+                <div>
+                  <strong>Key:</strong> RSA {result.keyBits} ·{" "}
+                  <span className="font-mono">SHA-256 {result.publicKeyFingerprintSha256}</span>
+                </div>
+                <div className="pt-1 text-muted-foreground">
+                  Submit the CSR below to your internal PKI. When the signed certificate is
+                  returned, paste it into the Certificate field and click Save — the matching
+                  private key is already stored.
+                </div>
+              </AlertDescription>
+            </Alert>
+            <Textarea
+              rows={12}
+              readOnly
+              value={result.csrPem}
+              className="font-mono text-xs"
+              data-testid="textarea-csr-result"
+            />
+          </div>
+        )}
+
+        <DialogFooter>
+          {result ? (
+            <>
+              <Button variant="outline" onClick={copyCsr} data-testid="button-copy-csr">
+                <Copy className="mr-2 h-4 w-4" /> Copy
+              </Button>
+              <Button variant="outline" onClick={downloadCsr} data-testid="button-download-csr">
+                <Download className="mr-2 h-4 w-4" /> Download .csr
+              </Button>
+              <Button onClick={() => setOpen(false)}>Done</Button>
+            </>
+          ) : (
+            <>
+              <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+              <Button
+                onClick={() => generate.mutate()}
+                disabled={generate.isPending || !commonName.trim()}
+                data-testid="button-generate-csr"
+              >
+                {generate.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Generate
+              </Button>
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+type NotificationBatchStatus = {
+  batchIntervalMinutes: number;
+  lastRunAt: string | null;
+  nextRunAt: string;
+  queuedCount: number;
+};
+
+function formatCountdown(ms: number): string {
+  if (ms <= 0) return "any moment now";
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  if (m === 0) return `${s}s`;
+  if (m < 60) return `${m}m ${s.toString().padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `${h}h ${rm}m`;
+}
+
+function NotificationsBatchPanel() {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: ["settings.notifications"],
+    queryFn: () => api.get<NotificationBatchStatus>("/settings/notifications"),
+    // Refresh every 15s so the countdown stays roughly accurate even
+    // without re-rendering on a 1-second tick.
+    refetchInterval: 15_000,
+  });
+  const [interval, setIntervalMinutes] = useState<number | null>(null);
+  useEffect(() => {
+    if (q.data && interval === null) setIntervalMinutes(q.data.batchIntervalMinutes);
+  }, [q.data, interval]);
+
+  // Local 1-second tick so the "Next send in …" countdown is smooth without
+  // hammering the API.
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const save = useMutation({
+    mutationFn: (mins: number) =>
+      api.put<NotificationBatchStatus>("/settings/notifications", { batchIntervalMinutes: mins }),
+    onSuccess: (row) => {
+      toast.success("Notification interval saved");
+      setIntervalMinutes(row.batchIntervalMinutes);
+      qc.invalidateQueries({ queryKey: ["settings.notifications"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+  });
+
+  const flush = useMutation({
+    mutationFn: () => api.post<{ usersNotified: number; itemsSent: number; status: NotificationBatchStatus }>(
+      "/settings/notifications/flush",
+      {},
+    ),
+    onSuccess: (r) => {
+      if (r.itemsSent === 0) toast.success("Queue is empty — nothing to send");
+      else toast.success(`Sent ${r.itemsSent} notification(s) to ${r.usersNotified} user(s)`);
+      qc.invalidateQueries({ queryKey: ["settings.notifications"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Flush failed"),
+  });
+
+  // Discard the pending queue without sending — for systems where SMTP is
+  // disabled and queued digests would only pile up.
+  const clear = useMutation({
+    mutationFn: () => api.post<{ discarded: number; status: NotificationBatchStatus }>(
+      "/settings/notifications/clear",
+      {},
+    ),
+    onSuccess: (r) => {
+      toast.success(r.discarded === 0 ? "Queue is already empty" : `Discarded ${r.discarded} pending notification(s)`);
+      qc.invalidateQueries({ queryKey: ["settings.notifications"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Clear failed"),
+  });
+
+  if (!q.data || interval === null) return <Skeleton className="mt-4 h-64 w-full" />;
+
+  const nextMs = new Date(q.data.nextRunAt).getTime();
+  const remaining = nextMs - now;
+  const countdown = formatCountdown(remaining);
+  const lastRunLabel = q.data.lastRunAt ? fmtDateTime(q.data.lastRunAt) : "never";
+  const dirty = interval !== q.data.batchIntervalMinutes;
+  const valid = Number.isFinite(interval) && interval >= 1 && interval <= 1440;
+
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="text-base">Notification batching</CardTitle>
+        <CardDescription>
+          Group every user's pending notifications into a single branded email and send digests on a schedule
+          instead of one email per event. Each user only ever sees their own notifications — digests are built
+          per recipient.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <NotificationRoutingEditor />
+        <div className="grid gap-4 md:grid-cols-3">
+          <div className="rounded-md border border-border bg-muted/30 p-3">
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">Pending in queue</div>
+            <div className="mt-1 text-2xl font-semibold" data-testid="text-notifications-queued">
+              {q.data.queuedCount}
+            </div>
+            <div className="text-xs text-muted-foreground">item(s) waiting for next digest</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/30 p-3">
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">Next send in</div>
+            <div className="mt-1 text-2xl font-semibold" data-testid="text-notifications-countdown">
+              {countdown}
+            </div>
+            <div className="text-xs text-muted-foreground">
+              at {fmtDate(q.data.nextRunAt, "HH:mm")}
+            </div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/30 p-3">
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">Last run</div>
+            <div className="mt-1 text-base font-medium">{lastRunLabel}</div>
+            <div className="text-xs text-muted-foreground">timestamp of the most recent digest</div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="batch-interval">Send digest every</Label>
+          <div className="flex items-center gap-2">
+            <Input
+              id="batch-interval"
+              type="number"
+              min={1}
+              max={1440}
+              value={interval}
+              onChange={(e) => setIntervalMinutes(Number(e.target.value))}
+              className="max-w-xs"
+              data-testid="input-batch-interval"
+            />
+            <span className="text-xs text-muted-foreground">minutes (1 – 1440)</span>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Lower values are more responsive but may produce more email; higher values further reduce volume.
+            Changes take effect on the next worker tick (within ~30 seconds).
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-4">
+          <Button
+            variant="outline"
+            onClick={() => flush.mutate()}
+            disabled={flush.isPending}
+            data-testid="button-flush-now"
+          >
+            {flush.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            Send digest now
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => {
+              if (window.confirm(`Discard ${q.data.queuedCount} pending notification(s) without sending them? This cannot be undone.`)) {
+                clear.mutate();
+              }
+            }}
+            disabled={clear.isPending || q.data.queuedCount === 0}
+            data-testid="button-clear-queue"
+          >
+            {clear.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
+            Discard queue
+          </Button>
+          <Button
+            onClick={() => save.mutate(interval)}
+            disabled={save.isPending || !dirty || !valid}
+            data-testid="button-save-batch-interval"
+          >
+            {save.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            <Save className="mr-2 h-4 w-4" /> Save
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+type RoutingRule = {
+  id?: number;
+  eventKey: string;
+  kind: "owner" | "assignee" | "role" | "per_change_role" | "collaborator";
+  roleKey: string | null;
+  trackFilter: string | null;
+  excludeActor: boolean;
+  isActive: boolean;
+  sortOrder: number;
+};
+
+type RoutingPayload = {
+  events: readonly string[];
+  rules: RoutingRule[];
+};
+
+type RoleRow = { key: string; name: string };
+
+const ROUTABLE_EVENT_META: Record<string, { label: string; hint: string }> = {
+  "change.submitted": {
+    label: "Change submitted",
+    hint: "Fires when a change leaves draft (normal: → In review, emergency: → Awaiting approval).",
+  },
+  "change.cancelled": {
+    label: "Change cancelled",
+    hint: "Fires when a change moves to Cancelled from any state.",
+  },
+  "change.completed": {
+    label: "Change completed",
+    hint: "Fires when the PIR is signed off and the change is closed.",
+  },
+  "approval.granted": {
+    label: "Approval granted (Change Manager)",
+    hint: "Fires only when the Change Manager (or their deputy) approves. Other approval votes are silent.",
+  },
+  "test.signed_off": {
+    label: "Production testing passed",
+    hint: "Fires only on a passed production sign-off. Pre-prod and failed verdicts are silent.",
+  },
+  "comment.added": {
+    label: "Comment added",
+    hint: "Fires when anyone comments on a change. The comment author is automatically excluded.",
+  },
+  "pir.due": {
+    label: "PIR due",
+    hint: "Automated reminder when a post-implementation review is overdue.",
+  },
+  "pentest.requested": {
+    label: "PenTest request opened",
+    hint: "Fires when a new penetration-test request is created. Emails stay minimal — no scope or findings — because pentest data is TopSecret.",
+  },
+  "pentest.status_changed": {
+    label: "PenTest status changed",
+    hint: "Fires when a pentest request moves to a new status (e.g. scheduled, reported, closed). The person who made the change is automatically excluded by default.",
+  },
+};
+
+// Pentest events route off a different context than changes: there is no
+// assignee, per-change role, or track — recipients are the request creator
+// ("owner"), its collaborators, or a global role pool.
+const PENTEST_ROUTABLE_EVENTS = new Set(["pentest.requested", "pentest.status_changed"]);
+const isPentestEvent = (evt: string) => PENTEST_ROUTABLE_EVENTS.has(evt);
+
+const CHANGE_KIND_OPTIONS: Array<{ value: RoutingRule["kind"]; label: string; needsRole: boolean }> = [
+  { value: "owner", label: "Change creator", needsRole: false },
+  { value: "assignee", label: "Change owner", needsRole: false },
+  { value: "role", label: "Role pool", needsRole: true },
+  { value: "per_change_role", label: "Per-change role (with role-pool fallback)", needsRole: true },
+];
+
+const PENTEST_KIND_OPTIONS: Array<{ value: RoutingRule["kind"]; label: string; needsRole: boolean }> = [
+  { value: "owner", label: "Request creator", needsRole: false },
+  { value: "collaborator", label: "Request collaborators", needsRole: false },
+  { value: "role", label: "Role pool", needsRole: true },
+];
+
+const kindOptionsFor = (evt: string) => (isPentestEvent(evt) ? PENTEST_KIND_OPTIONS : CHANGE_KIND_OPTIONS);
+
+const defaultRoleKeyFor = (evt: string) => (isPentestEvent(evt) ? "pentest_mgmt" : "change_manager");
+
+// PenTest data is need-to-know; pentest role-pool rules may only target this
+// allowlist. Mirrors the server-side guard in routes/notification-routing.ts.
+const PENTEST_ALLOWED_ROLE_KEYS = new Set(["pentest_mgmt"]);
+
+const TRACK_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "__all__", label: "All tracks" },
+  { value: "normal", label: "Normal only" },
+  { value: "emergency", label: "Emergency only" },
+  { value: "standard", label: "Standard only" },
+];
+
+const PER_CHANGE_ROLE_OPTIONS = ["implementer", "tester"] as const;
+
+function NotificationRoutingEditor() {
+  const qc = useQueryClient();
+  const q = useQuery({
+    queryKey: ["notification-routing"],
+    queryFn: () => api.get<RoutingPayload>("/notification-routing"),
+  });
+  const rolesQ = useQuery({
+    queryKey: ["roles"],
+    queryFn: () => api.get<RoleRow[]>("/roles"),
+  });
+  const [draft, setDraft] = useState<RoutingRule[] | null>(null);
+
+  useEffect(() => {
+    if (q.data && draft === null) {
+      setDraft(q.data.rules.map((r) => ({ ...r })));
+    }
+  }, [q.data, draft]);
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.put<RoutingPayload>("/notification-routing", {
+        rules: (draft ?? []).map((r, i) => ({
+          eventKey: r.eventKey,
+          kind: r.kind,
+          roleKey: r.kind === "role" || r.kind === "per_change_role" ? r.roleKey : null,
+          trackFilter: r.trackFilter,
+          excludeActor: r.excludeActor,
+          isActive: r.isActive,
+          sortOrder: i,
+        })),
+      }),
+    onSuccess: (data) => {
+      qc.setQueryData(["notification-routing"], data);
+      setDraft(data.rules.map((r) => ({ ...r })));
+      toast.success("Notification routing saved");
+    },
+    onError: (e: Error) => toast.error(e.message || "Save failed"),
+  });
+
+  const reset = useMutation({
+    mutationFn: () => api.post<RoutingPayload>("/notification-routing/reset", {}),
+    onSuccess: (data) => {
+      qc.setQueryData(["notification-routing"], data);
+      setDraft(data.rules.map((r) => ({ ...r })));
+      toast.success("Reset to defaults");
+    },
+    onError: (e: Error) => toast.error(e.message || "Reset failed"),
+  });
+
+  if (q.isLoading || !q.data || draft === null) {
+    return <Skeleton className="h-72 w-full" />;
+  }
+  const events = q.data.events;
+  const rolesByKey = new Map((rolesQ.data ?? []).map((r) => [r.key, r.name] as const));
+  const dirty = JSON.stringify(draft) !== JSON.stringify(q.data.rules);
+
+  const updateRule = (idx: number, patch: Partial<RoutingRule>) => {
+    setDraft((prev) => (prev ? prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)) : prev));
+  };
+  const removeRule = (idx: number) => {
+    setDraft((prev) => (prev ? prev.filter((_, i) => i !== idx) : prev));
+  };
+  const addRule = (eventKey: string) => {
+    setDraft((prev) =>
+      prev
+        ? [
+            ...prev,
+            {
+              eventKey,
+              kind: "owner",
+              roleKey: null,
+              trackFilter: null,
+              excludeActor: eventKey === "comment.added" || eventKey === "pentest.status_changed",
+              isActive: true,
+              sortOrder: prev.length,
+            },
+          ]
+        : prev,
+    );
+  };
+
+  return (
+    <div
+      className="rounded-md border border-border bg-muted/20 p-4 text-sm"
+      data-testid="notification-routing-editor"
+    >
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="text-sm font-semibold">Who gets notified, and when</div>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => reset.mutate()}
+            disabled={reset.isPending || save.isPending}
+            data-testid="button-routing-reset"
+          >
+            Reset to defaults
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => save.mutate()}
+            disabled={!dirty || save.isPending}
+            data-testid="button-routing-save"
+          >
+            {save.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+            Save routing
+          </Button>
+        </div>
+      </div>
+      <p className="mb-4 text-xs text-muted-foreground">
+        Define exactly which users get an email for each lifecycle event. Each event can have any number of
+        recipient rules — they are unioned together. Change subjects open with{" "}
+        <span className="font-mono">[CHG &lt;ref&gt;]</span> and pentest subjects with{" "}
+        <span className="font-mono">[PenTest &lt;ref&gt;]</span>. Anything not configured here is
+        recorded in the audit log but does not produce email. The batch schedule below only controls digest
+        cadence, not the recipient list.
+      </p>
+      <div className="space-y-4">
+        {events.map((evt) => {
+          const meta = ROUTABLE_EVENT_META[evt] ?? { label: evt, hint: "" };
+          const rules = draft
+            .map((r, i) => ({ rule: r, idx: i }))
+            .filter((r) => r.rule.eventKey === evt);
+          return (
+            <div
+              key={evt}
+              className="rounded border border-border bg-background p-3"
+              data-testid={`routing-event-${evt}`}
+            >
+              <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+                <div>
+                  <div className="text-sm font-medium">{meta.label}</div>
+                  <div className="text-[11px] text-muted-foreground">{meta.hint}</div>
+                </div>
+                <span className="font-mono text-[11px] text-muted-foreground">{evt}</span>
+              </div>
+              {rules.length === 0 ? (
+                <div className="mb-2 rounded border border-dashed border-border p-2 text-xs italic text-muted-foreground">
+                  No recipients — nobody will be emailed for this event.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {rules.map(({ rule, idx }) => {
+                    const kindOptions = kindOptionsFor(evt);
+                    const meta = kindOptions.find((k) => k.value === rule.kind);
+                    return (
+                      <div
+                        key={idx}
+                        className="grid grid-cols-1 gap-2 rounded border border-border bg-muted/30 p-2 md:grid-cols-[1.4fr_1.4fr_1fr_auto_auto]"
+                      >
+                        <Select
+                          value={rule.kind}
+                          onValueChange={(v) =>
+                            updateRule(idx, {
+                              kind: v as RoutingRule["kind"],
+                              roleKey:
+                                v === "per_change_role"
+                                  ? "implementer"
+                                  : v === "role"
+                                    ? rule.roleKey ?? defaultRoleKeyFor(evt)
+                                    : null,
+                            })
+                          }
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {kindOptions.map((k) => (
+                              <SelectItem key={k.value} value={k.value} className="text-xs">
+                                {k.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        {meta?.needsRole ? (
+                          <Select
+                            value={rule.roleKey ?? ""}
+                            onValueChange={(v) => updateRule(idx, { roleKey: v })}
+                          >
+                            <SelectTrigger className="h-8 text-xs">
+                              <SelectValue placeholder="Pick a role…" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {rule.kind === "per_change_role"
+                                ? PER_CHANGE_ROLE_OPTIONS.map((rk) => (
+                                    <SelectItem key={rk} value={rk} className="text-xs">
+                                      {rolesByKey.get(rk) ?? rk}
+                                    </SelectItem>
+                                  ))
+                                : (rolesQ.data ?? [])
+                                    .filter(
+                                      (r) =>
+                                        !isPentestEvent(evt) ||
+                                        PENTEST_ALLOWED_ROLE_KEYS.has(r.key),
+                                    )
+                                    .map((r) => (
+                                      <SelectItem key={r.key} value={r.key} className="text-xs">
+                                        {r.name}
+                                      </SelectItem>
+                                    ))}
+                            </SelectContent>
+                          </Select>
+                        ) : (
+                          <div className="text-[11px] italic text-muted-foreground self-center">
+                            (no role needed)
+                          </div>
+                        )}
+                        {isPentestEvent(evt) ? (
+                          <div className="self-center text-[11px] italic text-muted-foreground">
+                            (all requests)
+                          </div>
+                        ) : (
+                          <Select
+                            value={rule.trackFilter ?? "__all__"}
+                            onValueChange={(v) =>
+                              updateRule(idx, { trackFilter: v === "__all__" ? null : v })
+                            }
+                          >
+                            <SelectTrigger className="h-8 text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {TRACK_OPTIONS.map((t) => (
+                                <SelectItem key={t.value} value={t.value} className="text-xs">
+                                  {t.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <label className="flex items-center gap-1 text-[11px] text-muted-foreground self-center">
+                          <Switch
+                            checked={rule.excludeActor}
+                            onCheckedChange={(v) => updateRule(idx, { excludeActor: !!v })}
+                          />
+                          Exclude actor
+                        </label>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 px-2 text-xs text-destructive"
+                          onClick={() => removeRule(idx)}
+                          data-testid={`button-routing-remove-${evt}-${idx}`}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="mt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => addRule(evt)}
+                  data-testid={`button-routing-add-${evt}`}
+                >
+                  + Add recipient
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-4 rounded border border-dashed border-border bg-background p-3 text-xs text-muted-foreground">
+        <div className="mb-1 font-medium text-foreground">Other events (not configurable here)</div>
+        <ul className="list-disc space-y-0.5 pl-4">
+          <li>
+            <span className="font-mono">approval.requested</span> — sent to the approver pool of the role being
+            asked (per-change assignee, with role-pool fallback). Inherent to the approval row.
+          </li>
+          <li>
+            <span className="font-mono">cab.invited / cab.reminder / cab.minutes</span> — sent to the standing
+            CAB or eCAB roster of the meeting, plus creators of changes on the agenda. Inherent to the meeting.
+          </li>
+        </ul>
+        <div className="mt-2">
+          Each user can still mute any event for themselves under{" "}
+          <em>Account → Notification preferences</em>.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackupPanel() {
+  const [downloading, setDownloading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [pendingFile, setPendingFile] = useState<{ name: string; payload: unknown; rowCount: number } | null>(null);
+  const [confirmText, setConfirmText] = useState("");
+
+  async function handleDownload() {
+    setDownloading(true);
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      await api.download(`/backup`, `change-mgmt-backup-${stamp}.json`);
+      toast.success("Backup downloaded");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Backup failed");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  async function handleFilePicked(file: File) {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as { tables?: Record<string, unknown[]> };
+      const rowCount = parsed?.tables
+        ? Object.values(parsed.tables).reduce((a, rows) => a + (Array.isArray(rows) ? rows.length : 0), 0)
+        : 0;
+      setPendingFile({ name: file.name, payload: parsed, rowCount });
+      setConfirmText("");
+      setConfirmOpen(true);
+    } catch (err) {
+      toast.error(err instanceof Error ? `Invalid backup file: ${err.message}` : "Invalid backup file");
+    }
+  }
+
+  async function handleRestore() {
+    if (!pendingFile) return;
+    setRestoring(true);
+    try {
+      await api.post<{ ok: boolean; restored: Record<string, number> }>("/backup/restore", pendingFile.payload);
+      toast.success("Database restored. Reloading…");
+      setConfirmOpen(false);
+      setPendingFile(null);
+      // Cached queries reflect the OLD data; force a full reload to pick up
+      // the new dataset and (likely) re-authenticate against restored users.
+      setTimeout(() => window.location.reload(), 800);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Restore failed");
+    } finally {
+      setRestoring(false);
+    }
+  }
+
+  return (
+    <div className="mt-4 space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Backup</CardTitle>
+          <CardDescription>
+            Download a single JSON file containing every table in the database — users, roles, change requests, approvals,
+            CAB meetings, comments, audit log, and all system settings. Store the file somewhere safe; anyone with it can
+            restore your environment.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Button onClick={handleDownload} disabled={downloading} data-testid="button-backup-download">
+            {downloading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}
+            Download backup
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base text-destructive">Restore</CardTitle>
+          <CardDescription>
+            Replace the entire database with the contents of a backup file. All current data — including users, change
+            requests, and the audit log — will be permanently overwritten. You will be logged out if your account does not
+            exist in the backup.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Alert variant="destructive">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription>
+              This action cannot be undone. Take a fresh backup first if you might want to roll back.
+            </AlertDescription>
+          </Alert>
+          <div>
+            <input
+              id="backup-restore-file"
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              data-testid="input-backup-file"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) void handleFilePicked(f);
+              }}
+            />
+            <Button
+              variant="destructive"
+              onClick={() => document.getElementById("backup-restore-file")?.click()}
+              data-testid="button-backup-restore"
+            >
+              <Upload className="mr-2 h-4 w-4" /> Choose backup file…
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Dialog open={confirmOpen} onOpenChange={(o) => { if (!restoring) setConfirmOpen(o); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm full restore</DialogTitle>
+            <DialogDescription>
+              You are about to overwrite the entire database with{" "}
+              <span className="font-mono">{pendingFile?.name ?? "the selected file"}</span>{" "}
+              ({pendingFile?.rowCount.toLocaleString() ?? 0} rows). Type <span className="font-semibold">RESTORE</span> below to proceed.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="restore-confirm">Confirmation</Label>
+            <Input
+              id="restore-confirm"
+              value={confirmText}
+              onChange={(e) => setConfirmText(e.target.value)}
+              placeholder="RESTORE"
+              autoComplete="off"
+              data-testid="input-restore-confirm"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={restoring}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleRestore}
+              disabled={confirmText !== "RESTORE" || restoring}
+              data-testid="button-restore-confirm"
+            >
+              {restoring && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Restore now
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+// Manage the lookup table that backs the Category dropdown on every change form.
+// Admins can add new buckets, rename them, reorder via sortOrder, or deactivate
+// entries. Deactivation hides a category from the dropdown but keeps it on
+// historical changes; deleting an in-use category soft-deactivates server-side.
+function CategoriesPanel() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["categories"], queryFn: () => api.get<CategoryItem[]>("/categories") });
+  const [editing, setEditing] = useState<Partial<CategoryItem> | null>(null);
+
+  const save = useMutation({
+    mutationFn: async (c: Partial<CategoryItem>) => {
+      if (c.id) return api.patch<CategoryItem>(`/categories/${c.id}`, { name: c.name, sortOrder: c.sortOrder, isActive: c.isActive });
+      return api.post<CategoryItem>("/categories", { name: c.name, sortOrder: c.sortOrder ?? 100, isActive: c.isActive ?? true });
+    },
+    onSuccess: () => {
+      toast.success("Category saved");
+      qc.invalidateQueries({ queryKey: ["categories"] });
+      setEditing(null);
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.delete(`/categories/${id}`),
+    onSuccess: () => {
+      toast.success("Category removed");
+      qc.invalidateQueries({ queryKey: ["categories"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Delete failed"),
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Change categories</CardTitle>
+            <CardDescription>Buckets used to classify each change request — surfaced in the New change form and in dashboards.</CardDescription>
+          </div>
+          <Button onClick={() => setEditing({ name: "", sortOrder: 100, isActive: true })} data-testid="button-new-category">
+            New category
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {q.isLoading ? (
+          <Skeleton className="h-32" />
+        ) : (
+          <div className="divide-y divide-border rounded-md border border-border">
+            {(q.data ?? []).length === 0 && (
+              <p className="p-4 text-sm text-muted-foreground">No categories defined yet.</p>
+            )}
+            {(q.data ?? []).map((c) => (
+              <div key={c.id} className="flex items-center justify-between gap-3 px-3 py-2" data-testid={`row-category-${c.id}`}>
+                <div className="flex items-center gap-3">
+                  <span className="font-mono text-xs text-muted-foreground">{c.key}</span>
+                  <span className="text-sm">{c.name}</span>
+                  <span className="text-xs text-muted-foreground">order {c.sortOrder}</span>
+                  {!c.isActive && <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase">inactive</span>}
+                </div>
+                <div className="flex items-center gap-1">
+                  <Button size="sm" variant="ghost" onClick={() => setEditing({ ...c })} data-testid={`button-edit-category-${c.id}`}>Edit</Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => { if (confirm(`Remove "${c.name}"? In-use categories will be deactivated.`)) del.mutate(c.id); }}
+                    data-testid={`button-delete-category-${c.id}`}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+      <Dialog open={editing != null} onOpenChange={(o) => !o && setEditing(null)}>
+        <DialogContent>
+          {editing && (
+            <>
+              <DialogHeader><DialogTitle>{editing.id ? "Edit category" : "New category"}</DialogTitle></DialogHeader>
+              <div className="grid gap-3 py-2">
+                <div className="space-y-2">
+                  <Label>Name <span className="text-destructive">*</span></Label>
+                  <Input
+                    value={editing.name ?? ""}
+                    onChange={(e) => setEditing({ ...editing, name: e.target.value })}
+                    data-testid="input-category-name"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Sort order</Label>
+                  <Input
+                    type="number"
+                    value={editing.sortOrder ?? 100}
+                    onChange={(e) => setEditing({ ...editing, sortOrder: Number(e.target.value) })}
+                    data-testid="input-category-sort"
+                  />
+                </div>
+                <div className="flex items-center justify-between rounded-md border border-border p-3">
+                  <Label>Active</Label>
+                  <Switch
+                    checked={editing.isActive ?? true}
+                    onCheckedChange={(v) => setEditing({ ...editing, isActive: v })}
+                  />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setEditing(null)}>Cancel</Button>
+                <Button
+                  onClick={() => {
+                    if (!editing.name?.trim()) { toast.error("Name is required"); return; }
+                    save.mutate(editing);
+                  }}
+                  disabled={save.isPending}
+                  data-testid="button-save-category"
+                >
+                  {save.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Save
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </Card>
+  );
+}
+
+function PentestTypesPanel() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ["pentest-test-types"], queryFn: () => api.get<PentestTestType[]>("/pentest-test-types") });
+  const [editing, setEditing] = useState<Partial<PentestTestType> | null>(null);
+
+  const save = useMutation({
+    mutationFn: async (t: Partial<PentestTestType>) => {
+      if (t.id) return api.patch<PentestTestType>(`/pentest-test-types/${t.id}`, { name: t.name, sortOrder: t.sortOrder, isActive: t.isActive });
+      return api.post<PentestTestType>("/pentest-test-types", { name: t.name, sortOrder: t.sortOrder ?? 100, isActive: t.isActive ?? true });
+    },
+    onSuccess: () => {
+      toast.success("Test type saved");
+      qc.invalidateQueries({ queryKey: ["pentest-test-types"] });
+      setEditing(null);
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Save failed"),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.delete(`/pentest-test-types/${id}`),
+    onSuccess: () => {
+      toast.success("Test type removed");
+      qc.invalidateQueries({ queryKey: ["pentest-test-types"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : "Delete failed"),
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Penetration-test types</CardTitle>
+            <CardDescription>Engagement types selectable when opening a confidential PenTest request.</CardDescription>
+          </div>
+          <Button onClick={() => setEditing({ name: "", sortOrder: 100, isActive: true })} data-testid="button-new-pentest-type">
+            New test type
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {q.isLoading ? (
+          <Skeleton className="h-32" />
+        ) : (
+          <div className="divide-y divide-border rounded-md border border-border">
+            {(q.data ?? []).length === 0 && (
+              <p className="p-4 text-sm text-muted-foreground">No test types defined yet.</p>
+            )}
+            {(q.data ?? []).map((t) => (
+              <div key={t.id} className="flex items-center justify-between gap-3 px-3 py-2" data-testid={`row-pentest-type-${t.id}`}>
+                <div className="flex items-center gap-3">
+                  <span className="font-mono text-xs text-muted-foreground">{t.key}</span>
+                  <span className="text-sm">{t.name}</span>
+                  <span className="text-xs text-muted-foreground">order {t.sortOrder}</span>
+                  {!t.isActive && <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase">inactive</span>}
+                </div>
+                <div className="flex items-center gap-1">
+                  <Button size="sm" variant="ghost" onClick={() => setEditing({ ...t })} data-testid={`button-edit-pentest-type-${t.id}`}>Edit</Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => { if (confirm(`Remove "${t.name}"? In-use types will be deactivated.`)) del.mutate(t.id); }}
+                    data-testid={`button-delete-pentest-type-${t.id}`}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+      <Dialog open={editing != null} onOpenChange={(o) => !o && setEditing(null)}>
+        <DialogContent>
+          {editing && (
+            <>
+              <DialogHeader><DialogTitle>{editing.id ? "Edit test type" : "New test type"}</DialogTitle></DialogHeader>
+              <div className="grid gap-3 py-2">
+                <div className="space-y-2">
+                  <Label>Name <span className="text-destructive">*</span></Label>
+                  <Input
+                    value={editing.name ?? ""}
+                    onChange={(e) => setEditing({ ...editing, name: e.target.value })}
+                    data-testid="input-pentest-type-name"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Sort order</Label>
+                  <Input
+                    type="number"
+                    value={editing.sortOrder ?? 100}
+                    onChange={(e) => setEditing({ ...editing, sortOrder: Number(e.target.value) })}
+                    data-testid="input-pentest-type-sort"
+                  />
+                </div>
+                <div className="flex items-center justify-between rounded-md border border-border p-3">
+                  <Label>Active</Label>
+                  <Switch
+                    checked={editing.isActive ?? true}
+                    onCheckedChange={(v) => setEditing({ ...editing, isActive: v })}
+                  />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setEditing(null)}>Cancel</Button>
+                <Button
+                  onClick={() => {
+                    if (!editing.name?.trim()) { toast.error("Name is required"); return; }
+                    save.mutate(editing);
+                  }}
+                  disabled={save.isPending}
+                  data-testid="button-save-pentest-type"
+                >
+                  {save.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Save
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </Card>
+  );
+}

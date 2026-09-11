@@ -1,0 +1,386 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import request from "supertest";
+import {
+  DbMock,
+  buildTestApp,
+  ADMIN_SESSION,
+  OWNER_SESSION,
+  STRANGER_SESSION,
+  CHANGE_MANAGER_SESSION,
+  ASSIGNEE_SESSION,
+} from "./test-helpers";
+
+const dbMock = new DbMock();
+const getChangeAccessMock = vi.fn();
+const getChangeViewAccessMock = vi.fn();
+
+vi.mock("@workspace/db", () => ({
+  db: dbMock,
+  changeRequestsTable: { _t: "change_requests" },
+  usersTable: { _t: "users" },
+  standardTemplatesTable: { _t: "standard_templates" },
+  planningRecordsTable: { _t: "planning_records" },
+  testRecordsTable: { _t: "test_records" },
+  pirRecordsTable: { _t: "pir_records" },
+  approvalsTable: { _t: "approvals" },
+  commentsTable: { _t: "comments" },
+  rolesTable: { _t: "roles" },
+  roleAssignmentsTable: { _t: "role_assignments" },
+  cabMeetingsTable: { _t: "cab_meetings" },
+  cabChangesTable: { _t: "cab_changes" },
+  discussionReadsTable: { _t: "discussion_reads" },
+  changeAssigneesTable: { _t: "change_assignees" },
+  attachmentsTable: { _t: "attachments" },
+}));
+
+vi.mock("drizzle-orm", () => ({
+  and: () => ({}),
+  desc: () => ({}),
+  eq: () => ({}),
+  ilike: () => ({}),
+  or: () => ({}),
+  sql: () => ({}),
+  isNull: () => ({}),
+  isNotNull: () => ({}),
+  inArray: () => ({}),
+}));
+
+vi.mock("../lib/auth", async () => {
+  const actual =
+    await vi.importActual<typeof import("../lib/auth")>("../lib/auth");
+  return {
+    ...actual,
+    requireAuth: (req: unknown, _res: unknown, next: () => void) => next(),
+    requireAdmin: (
+      req: { session?: { isAdmin?: boolean } },
+      res: { status: (n: number) => { json: (b: unknown) => void } },
+      next: () => void,
+    ) => {
+      if (!req.session) {
+        res.status(401).json({ error: "Not authenticated" });
+        return;
+      }
+      if (!req.session.isAdmin) {
+        res.status(403).json({ error: "Admin only" });
+        return;
+      }
+      next();
+    },
+    getChangeAccess: getChangeAccessMock,
+    getChangeViewAccess: getChangeViewAccessMock,
+  };
+});
+
+vi.mock("../lib/audit", () => ({ audit: vi.fn().mockResolvedValue(undefined) }));
+
+vi.mock("../lib/email", () => ({
+  notify: vi.fn().mockResolvedValue(undefined),
+  getUserEmail: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock("../lib/ref", () => ({ nextRef: vi.fn().mockResolvedValue("CHG-TEST-1") }));
+
+vi.mock("../lib/state-machine", () => ({
+  isTransitionAllowed: vi.fn().mockReturnValue(true),
+  listAllowedTransitions: vi.fn().mockReturnValue([]),
+  checkPhaseGates: vi.fn().mockReturnValue(null),
+}));
+
+const { default: changesRouter } = await import("./changes");
+
+const sampleChange = {
+  id: 1,
+  ref: "CHG-1",
+  title: "t",
+  description: "d",
+  track: "normal",
+  status: "draft",
+  risk: "low",
+  impact: "low",
+  priority: "medium",
+  category: "general",
+  ownerId: 10,
+  assigneeId: 20,
+  templateId: null,
+  cabMeetingId: null,
+  plannedStart: null,
+  plannedEnd: null,
+  actualStart: null,
+  actualEnd: null,
+  createdAt: new Date(),
+  updatedAt: new Date(),
+};
+
+describe("changes.ts authorization gates", () => {
+  beforeEach(() => {
+    dbMock.reset();
+    getChangeAccessMock.mockReset();
+    getChangeViewAccessMock.mockReset();
+  });
+
+  describe("GET /changes/:id", () => {
+    it("returns 403 when the caller has no view access", async () => {
+      dbMock.enqueue("select", [sampleChange]); // change lookup
+      getChangeViewAccessMock.mockResolvedValueOnce(null);
+      const app = buildTestApp(changesRouter, STRANGER_SESSION);
+      const res = await request(app).get("/api/changes/1");
+      expect(res.status).toBe(403);
+      expect(getChangeViewAccessMock).toHaveBeenCalledOnce();
+    });
+
+    it("allows a viewer (e.g. CAB member) to read (auth gate passes)", async () => {
+      dbMock.enqueue("select", [sampleChange]); // change lookup
+      // After auth passes the handler does many more lookups; queue dummies
+      // so the handler doesn't crash. We only assert it didn't 403.
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]); // owner user
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]); // assignee user
+      dbMock.enqueue("select", []); // planning
+      dbMock.enqueue("select", []); // testing
+      dbMock.enqueue("select", []); // pir
+      dbMock.enqueue("select", []); // approvals
+      dbMock.enqueue("select", []); // comments
+      getChangeViewAccessMock.mockResolvedValueOnce("cab_member");
+      const app = buildTestApp(changesRouter, OWNER_SESSION);
+      const res = await request(app).get("/api/changes/1");
+      expect(res.status).not.toBe(403);
+    });
+  });
+
+  describe("PATCH /changes/:id", () => {
+    it("returns 403 when getChangeAccess returns null", async () => {
+      dbMock.enqueue("select", [sampleChange]);
+      getChangeAccessMock.mockResolvedValueOnce(null);
+      const app = buildTestApp(changesRouter, STRANGER_SESSION);
+      const res = await request(app)
+        .patch("/api/changes/1")
+        .send({ title: "hacked" });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/owner|assignee|change manager|admin/i);
+    });
+
+    it("allows the owner to edit", async () => {
+      dbMock.enqueue("select", [sampleChange]); // before
+      dbMock.enqueue("update", [{ ...sampleChange, title: "new" }]);
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]); // expand owner
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]); // expand assignee
+      getChangeAccessMock.mockResolvedValueOnce("owner");
+      const app = buildTestApp(changesRouter, OWNER_SESSION);
+      const res = await request(app)
+        .patch("/api/changes/1")
+        .send({ title: "new" });
+      expect(res.status).not.toBe(403);
+    });
+
+    it("allows the assignee to edit", async () => {
+      dbMock.enqueue("select", [sampleChange]);
+      dbMock.enqueue("update", [sampleChange]);
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]);
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]);
+      getChangeAccessMock.mockResolvedValueOnce("assignee");
+      const app = buildTestApp(changesRouter, ASSIGNEE_SESSION);
+      const res = await request(app).patch("/api/changes/1").send({});
+      expect(res.status).not.toBe(403);
+    });
+
+    it("allows a change_manager to edit", async () => {
+      dbMock.enqueue("select", [sampleChange]);
+      dbMock.enqueue("update", [sampleChange]);
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]);
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]);
+      getChangeAccessMock.mockResolvedValueOnce("change_manager");
+      const app = buildTestApp(changesRouter, CHANGE_MANAGER_SESSION);
+      const res = await request(app).patch("/api/changes/1").send({});
+      expect(res.status).not.toBe(403);
+    });
+
+    it("allows an admin to edit", async () => {
+      dbMock.enqueue("select", [sampleChange]);
+      dbMock.enqueue("update", [sampleChange]);
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]);
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]);
+      getChangeAccessMock.mockResolvedValueOnce("admin");
+      const app = buildTestApp(changesRouter, ADMIN_SESSION);
+      const res = await request(app).patch("/api/changes/1").send({});
+      expect(res.status).not.toBe(403);
+    });
+  });
+
+  describe("DELETE /changes/:id (admin-only soft delete)", () => {
+    it("returns 403 for a non-admin (owner)", async () => {
+      const app = buildTestApp(changesRouter, OWNER_SESSION);
+      const res = await request(app).delete("/api/changes/1");
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/admin/i);
+    });
+
+    it("returns 403 for a non-admin (assignee)", async () => {
+      const app = buildTestApp(changesRouter, ASSIGNEE_SESSION);
+      const res = await request(app).delete("/api/changes/1");
+      expect(res.status).toBe(403);
+    });
+
+    it("returns 403 for a non-admin (change_manager)", async () => {
+      const app = buildTestApp(changesRouter, CHANGE_MANAGER_SESSION);
+      const res = await request(app).delete("/api/changes/1");
+      expect(res.status).toBe(403);
+    });
+
+    it("returns 401 when unauthenticated", async () => {
+      const app = buildTestApp(changesRouter, null);
+      const res = await request(app).delete("/api/changes/1");
+      expect(res.status).toBe(401);
+    });
+
+    it("allows admin to soft-delete (moves to recycle bin)", async () => {
+      dbMock.enqueue("select", [sampleChange]); // before lookup
+      dbMock.enqueue("update", [
+        { ...sampleChange, deletedAt: new Date(), deletedById: 1 },
+      ]); // soft-delete update
+      const app = buildTestApp(changesRouter, ADMIN_SESSION);
+      const res = await request(app).delete("/api/changes/1");
+      expect(res.status).toBe(204);
+    });
+
+    it("returns 404 when the change is already in the recycle bin", async () => {
+      dbMock.enqueue("select", [
+        { ...sampleChange, deletedAt: new Date(), deletedById: 1 },
+      ]);
+      const app = buildTestApp(changesRouter, ADMIN_SESSION);
+      const res = await request(app).delete("/api/changes/1");
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("recycle bin endpoints (admin-only)", () => {
+    it("GET /recycle-bin/changes returns 403 for non-admin", async () => {
+      const app = buildTestApp(changesRouter, OWNER_SESSION);
+      const res = await request(app).get("/api/recycle-bin/changes");
+      expect(res.status).toBe(403);
+    });
+
+    it("POST /changes/:id/restore returns 403 for non-admin", async () => {
+      const app = buildTestApp(changesRouter, CHANGE_MANAGER_SESSION);
+      const res = await request(app).post("/api/changes/1/restore");
+      expect(res.status).toBe(403);
+    });
+
+    it("DELETE /recycle-bin/changes returns 403 for non-admin", async () => {
+      const app = buildTestApp(changesRouter, STRANGER_SESSION);
+      const res = await request(app).delete("/api/recycle-bin/changes");
+      expect(res.status).toBe(403);
+    });
+
+    it("POST /changes/:id/restore returns 400 when change is not deleted", async () => {
+      dbMock.enqueue("select", [sampleChange]); // not soft-deleted
+      const app = buildTestApp(changesRouter, ADMIN_SESSION);
+      const res = await request(app).post("/api/changes/1/restore");
+      expect(res.status).toBe(400);
+    });
+
+    it("DELETE /recycle-bin/changes purges nothing when the bin is empty", async () => {
+      dbMock.enqueue("select", []); // no soft-deleted rows
+      const app = buildTestApp(changesRouter, ADMIN_SESSION);
+      const res = await request(app).delete("/api/recycle-bin/changes");
+      expect(res.status).toBe(200);
+      expect(res.body.purged).toBe(0);
+    });
+  });
+
+  describe("POST /changes/:id/transition", () => {
+    it("returns 403 when getChangeAccess returns null", async () => {
+      dbMock.enqueue("select", [sampleChange]);
+      getChangeAccessMock.mockResolvedValueOnce(null);
+      const app = buildTestApp(changesRouter, STRANGER_SESSION);
+      const res = await request(app)
+        .post("/api/changes/1/transition")
+        .send({ toStatus: "submitted" });
+      expect(res.status).toBe(403);
+    });
+
+    it("rejects owner attempting to flip into awaiting_approval", async () => {
+      dbMock.enqueue("select", [{ ...sampleChange, status: "draft" }]);
+      getChangeAccessMock.mockResolvedValueOnce("owner");
+      const app = buildTestApp(changesRouter, OWNER_SESSION);
+      const res = await request(app)
+        .post("/api/changes/1/transition")
+        .send({ toStatus: "awaiting_approval" });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/governance|admin/i);
+    });
+
+    it("rejects assignee attempting to flip into awaiting_approval", async () => {
+      dbMock.enqueue("select", [{ ...sampleChange, status: "draft" }]);
+      getChangeAccessMock.mockResolvedValueOnce("assignee");
+      const app = buildTestApp(changesRouter, ASSIGNEE_SESSION);
+      const res = await request(app)
+        .post("/api/changes/1/transition")
+        .send({ toStatus: "awaiting_approval" });
+      expect(res.status).toBe(403);
+    });
+
+    it("allows change_manager to transition into awaiting_approval (when CAB completed)", async () => {
+      const change = {
+        ...sampleChange,
+        status: "draft",
+        cabMeetingId: 5,
+      };
+      dbMock.enqueue("select", [change]); // change lookup
+      dbMock.enqueue("select", [{ id: 5, status: "completed" }]); // cab meeting
+      dbMock.enqueue("select", []); // planning
+      dbMock.enqueue("select", []); // testing
+      dbMock.enqueue("select", []); // pir
+      dbMock.enqueue("select", []); // approvals (none means allApproved=true)
+      dbMock.enqueue("update", [{ ...change, status: "awaiting_approval" }]);
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]); // expand owner
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]); // expand assignee
+      getChangeAccessMock.mockResolvedValueOnce("change_manager");
+      const app = buildTestApp(changesRouter, CHANGE_MANAGER_SESSION);
+      const res = await request(app)
+        .post("/api/changes/1/transition")
+        .send({ toStatus: "awaiting_approval" });
+      expect(res.status).not.toBe(403);
+    });
+
+    it("allows ecab_member to transition into awaiting_approval", async () => {
+      const change = {
+        ...sampleChange,
+        track: "emergency",
+        status: "draft",
+        cabMeetingId: 5,
+      };
+      dbMock.enqueue("select", [change]);
+      dbMock.enqueue("select", [{ id: 5, status: "completed" }]);
+      dbMock.enqueue("select", []);
+      dbMock.enqueue("select", []);
+      dbMock.enqueue("select", []);
+      dbMock.enqueue("select", []);
+      dbMock.enqueue("update", [{ ...change, status: "awaiting_approval" }]);
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]);
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]);
+      getChangeAccessMock.mockResolvedValueOnce("ecab_member");
+      const app = buildTestApp(changesRouter, CHANGE_MANAGER_SESSION);
+      const res = await request(app)
+        .post("/api/changes/1/transition")
+        .send({ toStatus: "awaiting_approval" });
+      expect(res.status).not.toBe(403);
+    });
+
+    it("allows owner to make non-approval transitions", async () => {
+      const change = { ...sampleChange, status: "draft" };
+      dbMock.enqueue("select", [change]); // change lookup
+      dbMock.enqueue("select", []); // planning
+      dbMock.enqueue("select", []); // testing
+      dbMock.enqueue("select", []); // pir
+      dbMock.enqueue("select", []); // approvals
+      dbMock.enqueue("update", [{ ...change, status: "submitted" }]);
+      dbMock.enqueue("select", [{ id: 10, fullName: "Owner" }]); // expand owner
+      dbMock.enqueue("select", [{ id: 20, fullName: "Assignee" }]); // expand assignee
+      getChangeAccessMock.mockResolvedValueOnce("owner");
+      const app = buildTestApp(changesRouter, OWNER_SESSION);
+      const res = await request(app)
+        .post("/api/changes/1/transition")
+        .send({ toStatus: "submitted" });
+      expect(res.status).not.toBe(403);
+    });
+  });
+});

@@ -1,0 +1,291 @@
+import { Router, type IRouter, type Request, type Response } from "express";
+import { eq, and } from "drizzle-orm";
+import {
+  db,
+  planningRecordsTable,
+  testRecordsTable,
+  pirRecordsTable,
+  changeRequestsTable,
+  type TestCase,
+} from "@workspace/db";
+import { requireAuth, getChangeAccess, getChangeViewAccess, isPrivilegedAccess } from "../lib/auth";
+import { audit } from "../lib/audit";
+import { notify } from "../lib/email";
+import { resolveRecipients } from "../lib/notification-routing";
+
+const router: IRouter = Router();
+
+// Ownership/role gate shared by every phase endpoint. Returns the change row when the
+// caller is allowed to access it, otherwise writes 403/404 and returns null.
+// `view: true` widens the gate to change viewers (e.g. CAB members / deputies) for
+// READ handlers; write handlers keep the stricter getChangeAccess gate.
+async function loadChangeForCaller(
+  req: Request,
+  res: Response,
+  opts: { view?: boolean } = {},
+): Promise<typeof changeRequestsTable.$inferSelect | null> {
+  const id = Number(req.params["id"]);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return null;
+  }
+  const [c] = await db.select().from(changeRequestsTable).where(eq(changeRequestsTable.id, id));
+  if (!c || c.deletedAt) {
+    res.status(404).json({ error: "Change not found" });
+    return null;
+  }
+  const access = opts.view
+    ? await getChangeViewAccess(req.session!, c)
+    : await getChangeAccess(req.session!, c);
+  if (!access) {
+    res.status(403).json({ error: "Forbidden" });
+    return null;
+  }
+  return c;
+}
+
+// PLANNING
+router.get("/changes/:id/planning", requireAuth, async (req, res): Promise<void> => {
+  const c = await loadChangeForCaller(req, res, { view: true });
+  if (!c) return;
+  const id = c.id;
+  const [row] = await db.select().from(planningRecordsTable).where(eq(planningRecordsTable.changeId, id));
+  res.json(
+    row ?? {
+      changeId: id,
+      scope: "",
+      implementationPlan: "",
+      rollbackPlan: "",
+      riskAssessment: "",
+      impactedServices: "",
+      communicationsPlan: "",
+      toInformSpoc: false,
+      procedure: "",
+      successCriteria: "",
+      signedOff: false,
+      signedOffAt: null,
+      signedOffBy: null,
+      updatedAt: new Date(),
+    },
+  );
+});
+
+router.put("/changes/:id/planning", requireAuth, async (req, res): Promise<void> => {
+  const c = await loadChangeForCaller(req, res);
+  if (!c) return;
+  const id = c.id;
+  // Once planning has been signed off it is locked; only an admin or governance
+  // role holder (change_manager / eCAB member / CAB chair) can overwrite (e.g.
+  // to clear sign-off). Owners / assignees must request a reopen.
+  const [existing] = await db.select().from(planningRecordsTable).where(eq(planningRecordsTable.changeId, id));
+  if (existing?.signedOff) {
+    const access = await getChangeAccess(req.session!, c);
+    if (!isPrivilegedAccess(access)) {
+      res.status(409).json({ error: "Planning is signed off and locked. Ask a Change Manager to reopen it." });
+      return;
+    }
+  }
+  const b = req.body ?? {};
+  const values = {
+    changeId: id,
+    scope: b.scope ?? "",
+    implementationPlan: b.implementationPlan ?? "",
+    rollbackPlan: b.rollbackPlan ?? "",
+    riskAssessment: b.riskAssessment ?? "",
+    impactedServices: b.impactedServices ?? "",
+    communicationsPlan: b.communicationsPlan ?? "",
+    toInformSpoc: !!b.toInformSpoc,
+    procedure: b.procedure ?? "",
+    successCriteria: b.successCriteria ?? "",
+    signedOff: !!b.signedOff,
+    signedOffAt: b.signedOff ? new Date() : null,
+    signedOffBy: b.signedOff ? req.session?.username ?? null : null,
+  };
+  const [row] = await db
+    .insert(planningRecordsTable)
+    .values(values)
+    .onConflictDoUpdate({ target: planningRecordsTable.changeId, set: values })
+    .returning();
+  await audit(req, {
+    action: "planning.updated",
+    entityType: "change",
+    entityId: id,
+    summary: `Planning updated${b.signedOff ? " (signed off)" : ""}`,
+    after: row,
+  });
+  res.json(row);
+});
+
+// TESTING — shared handlers for both production and pre-prod records. The
+// `kind` discriminator on test_records lets us keep both rows side by side
+// without duplicating the table definition or the form component.
+async function getTestingRow(id: number, kind: "production" | "preprod") {
+  const [row] = await db
+    .select()
+    .from(testRecordsTable)
+    .where(and(eq(testRecordsTable.changeId, id), eq(testRecordsTable.kind, kind)));
+  return row;
+}
+
+function emptyTestRow(id: number, kind: "production" | "preprod") {
+  return {
+    changeId: id,
+    kind,
+    testPlan: "",
+    environment: kind === "preprod" ? "preprod" : "production",
+    overallResult: "pending",
+    notes: "",
+    testedBy: null,
+    testedAt: null,
+    cases: [],
+    updatedAt: new Date(),
+  };
+}
+
+async function putTesting(req: Request, res: Response, kind: "production" | "preprod"): Promise<void> {
+  const c = await loadChangeForCaller(req, res);
+  if (!c) return;
+  const id = c.id;
+  // Production testing becomes immutable once the workflow leaves Testing for
+  // PIR (or reaches another terminal state). A governance revert to in_testing
+  // naturally reopens it because the current status no longer matches.
+  const productionTestingLocked =
+    kind === "production" &&
+    ["awaiting_pir", "completed", "rolled_back", "cancelled", "rejected"].includes(c.status);
+  if (productionTestingLocked) {
+    res.status(409).json({
+      error: "Testing is locked after proceeding to PIR. Revert the change to In Testing to edit it.",
+    });
+    return;
+  }
+  const b = req.body ?? {};
+  const cases: TestCase[] = Array.isArray(b.cases)
+    ? b.cases.map((c: TestCase) => ({
+        name: String(c.name ?? ""),
+        steps: String(c.steps ?? ""),
+        expectedResult: String(c.expectedResult ?? ""),
+        actualResult: String(c.actualResult ?? ""),
+        status: ["pending", "passed", "failed", "blocked"].includes(c.status) ? c.status : "pending",
+      }))
+    : [];
+  const overallResult = b.overallResult ?? "pending";
+  const values = {
+    changeId: id,
+    kind,
+    testPlan: b.testPlan ?? "",
+    environment: kind,
+    overallResult,
+    notes: b.notes ?? "",
+    cases,
+    testedBy: overallResult !== "pending" ? req.session?.username ?? null : null,
+    testedAt: overallResult !== "pending" ? new Date() : null,
+  };
+  const [row] = await db
+    .insert(testRecordsTable)
+    .values(values)
+    .onConflictDoUpdate({ target: [testRecordsTable.changeId, testRecordsTable.kind], set: values })
+    .returning();
+  await audit(req, {
+    action: kind === "preprod" ? "preprod_testing.updated" : "testing.updated",
+    entityType: "change",
+    entityId: id,
+    summary: `${kind === "preprod" ? "Pre-prod testing" : "Testing"} updated (overall: ${overallResult})`,
+    after: row,
+  });
+  // Notification stream is narrow: only fire when *production* testing is
+  // signed off as PASSED. Pre-prod results and failed runs are captured in
+  // the audit log + visible in-app but do not generate email.
+  if (kind === "production" && overallResult === "passed") {
+    const targets = await resolveRecipients("test.signed_off", {
+      changeId: c.id,
+      ownerId: c.ownerId,
+      assigneeId: c.assigneeId,
+      track: c.track,
+    });
+    if (targets.length > 0) {
+      await notify({
+        eventKey: "test.signed_off",
+        to: targets,
+        subject: `[CHG ${c.ref}] Production testing passed: ${c.title}`,
+        text: `${c.ref} ${c.title}\n\n${c.description ?? ""}\n\nProduction testing has been signed off as PASSED.`,
+      });
+    }
+  }
+  res.json(row);
+}
+
+router.get("/changes/:id/testing", requireAuth, async (req, res): Promise<void> => {
+  const c = await loadChangeForCaller(req, res, { view: true });
+  if (!c) return;
+  const row = await getTestingRow(c.id, "production");
+  res.json(row ?? emptyTestRow(c.id, "production"));
+});
+
+router.put("/changes/:id/testing", requireAuth, async (req, res): Promise<void> => {
+  await putTesting(req, res, "production");
+});
+
+router.get("/changes/:id/preprod-testing", requireAuth, async (req, res): Promise<void> => {
+  const c = await loadChangeForCaller(req, res, { view: true });
+  if (!c) return;
+  const row = await getTestingRow(c.id, "preprod");
+  res.json(row ?? emptyTestRow(c.id, "preprod"));
+});
+
+router.put("/changes/:id/preprod-testing", requireAuth, async (req, res): Promise<void> => {
+  await putTesting(req, res, "preprod");
+});
+
+// PIR
+router.get("/changes/:id/pir", requireAuth, async (req, res): Promise<void> => {
+  const c = await loadChangeForCaller(req, res, { view: true });
+  if (!c) return;
+  const id = c.id;
+  const [row] = await db.select().from(pirRecordsTable).where(eq(pirRecordsTable.changeId, id));
+  res.json(
+    row ?? {
+      changeId: id,
+      outcome: "successful",
+      objectivesMet: "",
+      issuesEncountered: "",
+      lessonsLearned: "",
+      followupActions: "",
+      completedBy: null,
+      completedAt: null,
+      updatedAt: new Date(),
+    },
+  );
+});
+
+router.put("/changes/:id/pir", requireAuth, async (req, res): Promise<void> => {
+  const c = await loadChangeForCaller(req, res);
+  if (!c) return;
+  const id = c.id;
+  const b = req.body ?? {};
+  const completed = !!b.completed;
+  const values = {
+    changeId: id,
+    outcome: b.outcome ?? "successful",
+    objectivesMet: b.objectivesMet ?? "",
+    issuesEncountered: b.issuesEncountered ?? "",
+    lessonsLearned: b.lessonsLearned ?? "",
+    followupActions: b.followupActions ?? "",
+    completedBy: completed ? req.session?.username ?? null : null,
+    completedAt: completed ? new Date() : null,
+  };
+  const [row] = await db
+    .insert(pirRecordsTable)
+    .values(values)
+    .onConflictDoUpdate({ target: pirRecordsTable.changeId, set: values })
+    .returning();
+  await audit(req, {
+    action: "pir.updated",
+    entityType: "change",
+    entityId: id,
+    summary: `PIR updated (outcome: ${values.outcome}${completed ? ", completed" : ""})`,
+    after: row,
+  });
+  res.json(row);
+});
+
+export default router;
