@@ -1,7 +1,8 @@
 import { createHash, createPublicKey, randomBytes } from "node:crypto";
+import { rootCertificates } from "node:tls";
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import type { Request, Response } from "express";
-import { fetch } from "undici";
+import { Agent, fetch } from "undici";
 import { eq } from "drizzle-orm";
 import { adfsSettingsTable, db } from "@workspace/db";
 import { signAuthState, verifyAuthState } from "./auth";
@@ -40,9 +41,11 @@ export type AdfsRuntimeConfig = {
   scope: string;
   usernameClaim: string;
   autoProvision: boolean;
+  caCertificatePem: string;
 };
 
-let discoveryCache: { issuer: string; expiresAt: number; value: DiscoveryDocument } | null = null;
+let discoveryCache: { issuer: string; caHash: string; expiresAt: number; value: DiscoveryDocument } | null = null;
+let tlsAgentCache: { caHash: string; agent: Agent } | null = null;
 
 function env(name: string): string {
   return (process.env[name] ?? "").trim();
@@ -58,6 +61,7 @@ function envConfiguration(): AdfsRuntimeConfig {
     scope: env("ADFS_SCOPE") || "openid profile email",
     usernameClaim: env("ADFS_USERNAME_CLAIM") || "upn",
     autoProvision: env("ADFS_AUTO_PROVISION") === "true",
+    caCertificatePem: env("ADFS_CA_CERT_PEM"),
   };
 }
 
@@ -79,6 +83,7 @@ export async function getAdfsConfiguration(): Promise<AdfsRuntimeConfig> {
     scope: row.scope || "openid profile email",
     usernameClaim: row.usernameClaim || "upn",
     autoProvision: row.autoProvision,
+    caCertificatePem: row.caCertificatePem ?? "",
   };
 }
 
@@ -116,17 +121,43 @@ function cookieOptions(req: Request) {
   };
 }
 
+function caHash(config: AdfsRuntimeConfig): string {
+  return config.caCertificatePem
+    ? createHash("sha256").update(config.caCertificatePem).digest("hex")
+    : "";
+}
+
+function adfsFetch(
+  config: AdfsRuntimeConfig,
+  url: string,
+  init?: Parameters<typeof fetch>[1],
+) {
+  if (!config.caCertificatePem) return fetch(url, init);
+  const hash = caHash(config);
+  if (!tlsAgentCache || tlsAgentCache.caHash !== hash) {
+    void tlsAgentCache?.agent.close();
+    tlsAgentCache = {
+      caHash: hash,
+      agent: new Agent({
+        connect: { ca: [...rootCertificates, config.caCertificatePem] },
+      }),
+    };
+  }
+  return fetch(url, { ...init, dispatcher: tlsAgentCache.agent });
+}
+
 function getDiscovery(config: AdfsRuntimeConfig, allowDisabled = false): Promise<DiscoveryDocument> {
   if (!allowDisabled) requireConfiguration(config);
   if (!config.issuer) throw new Error("ADFS issuer is required");
   if (
     discoveryCache &&
     discoveryCache.issuer === config.issuer &&
+    discoveryCache.caHash === caHash(config) &&
     discoveryCache.expiresAt > Date.now()
   ) {
     return Promise.resolve(discoveryCache.value);
   }
-  return fetch(`${config.issuer}/.well-known/openid-configuration`)
+  return adfsFetch(config, `${config.issuer}/.well-known/openid-configuration`)
     .then(async (response) => {
       if (!response.ok) throw new Error(`ADFS discovery returned HTTP ${response.status}`);
       const value = (await response.json()) as DiscoveryDocument;
@@ -135,6 +166,7 @@ function getDiscovery(config: AdfsRuntimeConfig, allowDisabled = false): Promise
       }
       discoveryCache = {
         issuer: config.issuer,
+        caHash: caHash(config),
         expiresAt: Date.now() + 5 * 60 * 1000,
         value,
       };
@@ -227,7 +259,7 @@ async function exchangeCode(
   if (config.clientSecret) {
     body.set("client_secret", config.clientSecret);
   }
-  const response = await fetch(discovery.token_endpoint, {
+  const response = await adfsFetch(config, discovery.token_endpoint, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body,
@@ -247,7 +279,7 @@ async function validateIdToken(
 ): Promise<AdfsClaims> {
   const decoded = jwt.decode(idToken, { complete: true });
   if (!decoded || typeof decoded === "string" || !decoded.header.kid) throw new Error("Invalid ADFS ID token");
-  const jwksResponse = await fetch(discovery.jwks_uri, { headers: { accept: "application/json" } });
+  const jwksResponse = await adfsFetch(config, discovery.jwks_uri, { headers: { accept: "application/json" } });
   if (!jwksResponse.ok) throw new Error(`ADFS JWKS returned HTTP ${jwksResponse.status}`);
   const jwks = (await jwksResponse.json()) as {
     keys?: Array<Record<string, unknown> & { kid?: string; alg?: string; use?: string }>;

@@ -16,6 +16,7 @@ import { audit } from "../lib/audit";
 import { sendTestEmail } from "../lib/email";
 import { testLdapConnection } from "../lib/ldap";
 import { testAdfsConfiguration } from "../lib/adfs";
+import { X509Certificate } from "node:crypto";
 import { generateCsr } from "../lib/csr";
 import { encryptSecret } from "../lib/secret-crypto";
 import {
@@ -252,6 +253,7 @@ function maskAdfs(row: typeof adfsSettingsTable.$inferSelect | undefined) {
     scope: row?.scope || "openid profile email",
     usernameClaim: row?.usernameClaim || "upn",
     autoProvision: row?.autoProvision ?? false,
+    caCertificateSet: !!row?.caCertificatePem,
   };
 }
 
@@ -282,6 +284,16 @@ router.put("/settings/adfs", requireAdmin, async (req, res): Promise<void> => {
         throw new Error("The redirect URI must use HTTPS.");
       }
     }
+    if (input.caCertificate?.trim()) {
+      const certificates =
+        input.caCertificate.match(
+          /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g,
+        ) ?? [];
+      if (!certificates.length) {
+        throw new Error("The AD FS CA certificate must be PEM encoded.");
+      }
+      for (const certificate of certificates) new X509Certificate(certificate);
+    }
   } catch (error) {
     res.status(400).json({
       error: error instanceof Error ? error.message : "Invalid ADFS URL.",
@@ -306,6 +318,10 @@ router.put("/settings/adfs", requireAdmin, async (req, res): Promise<void> => {
     scope: input.scope.trim() || "openid profile email",
     usernameClaim: input.usernameClaim.trim() || "upn",
     autoProvision: input.autoProvision,
+    caCertificatePem:
+      typeof input.caCertificate === "string" && input.caCertificate.trim()
+        ? input.caCertificate.trim()
+        : before?.caCertificatePem ?? null,
   };
   if (
     values.enabled &&

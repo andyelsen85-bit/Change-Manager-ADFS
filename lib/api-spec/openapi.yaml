@@ -1440,7 +1440,7 @@ components:
 
     AdfsSettings:
       type: object
-      required: [enabled, issuer, clientId, clientSecretSet, redirectUri, scope, usernameClaim, autoProvision]
+      required: [enabled, issuer, clientId, clientSecretSet, redirectUri, scope, usernameClaim, autoProvision, caCertificateSet]
       properties:
         enabled: { type: boolean }
         issuer: { type: string }
@@ -1450,6 +1450,7 @@ components:
         scope: { type: string }
         usernameClaim: { type: string }
         autoProvision: { type: boolean }
+        caCertificateSet: { type: boolean }
 
     AdfsSettingsUpdate:
       type: object
@@ -1465,6 +1466,9 @@ components:
         scope: { type: string }
         usernameClaim: { type: string }
         autoProvision: { type: boolean }
+        caCertificate:
+          type: ["string", "null"]
+          description: "Optional PEM-encoded CA certificate bundle used to verify AD FS HTTPS. A non-empty value replaces the stored bundle; null or an empty value keeps the existing bundle."
 
     AdfsTestResult:
       type: object

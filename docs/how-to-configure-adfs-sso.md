@@ -57,6 +57,27 @@ accepts both short names and the standard Microsoft claim URI forms. If your
 deployment uses another stable identifier, set `ADFS_USERNAME_CLAIM` to that
 claim name.
 
+In AD FS, add an **Issuance Transform Rule** using **Send LDAP Attributes as
+Claims** and map:
+
+- `User-Principal-Name` to `UPN`
+- `E-Mail-Addresses` to `E-Mail Address`
+- `Display-Name` to `Name`
+
+The OIDC `sub` claim is issued by AD FS and does not need a custom LDAP mapping.
+`upn` is the recommended login identifier. `email` is required when
+auto-provisioning is enabled; `name` is optional and is used as the display name
+for newly provisioned users.
+
+### Client permissions
+
+This integration signs users in and does not call a separate Web API. Permit the
+client to request the `openid` scope. The configured request also asks for
+`profile` and `email`; permit those when your AD FS version/application-group
+configuration exposes them. No `user_impersonation` or custom API permission is
+required for Change-it itself. If AD FS reports `invalid_scope`, first test with
+the scope set to `openid`, then add the optional scopes supported by the server.
+
 Start with a small test security group in the AD FS access policy. Do not grant
 the application to the whole directory until the round trip is verified.
 
@@ -76,7 +97,10 @@ Sign in to Change-it as an administrator, then open **Settings → ADFS**.
 5. Set the username claim to `upn`, or to the stable claim configured by your
    issuance rules.
 6. Leave auto-provisioning disabled for the first test.
-7. Save the configuration, then select **Test configuration** to verify the
+7. If AD FS uses an internal CA, upload or paste the PEM-encoded root and
+   intermediate CA certificates. Do not upload a private key or the AD FS
+   certificate unless it is itself the trust anchor.
+8. Save the configuration, then select **Test configuration** to verify the
    issuer discovery document and endpoints.
 
 When used, the client secret is never returned to the browser after it is

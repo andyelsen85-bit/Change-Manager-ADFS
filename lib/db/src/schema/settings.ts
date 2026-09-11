@@ -57,6 +57,8 @@ export const adfsSettingsTable = pgTable("adfs_settings", {
   scope: text("scope").notNull().default("openid profile email"),
   usernameClaim: text("username_claim").notNull().default("upn"),
   autoProvision: boolean("auto_provision").notNull().default(false),
+  // Optional internal CA bundle used only for outbound HTTPS requests to AD FS.
+  caCertificatePem: text("ca_certificate_pem"),
 });
 
 export const sslSettingsTable = pgTable("ssl_settings", {

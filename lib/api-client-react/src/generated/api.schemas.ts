@@ -908,6 +908,7 @@ export interface AdfsSettings {
   scope: string;
   usernameClaim: string;
   autoProvision: boolean;
+  caCertificateSet: boolean;
 }
 
 export interface AdfsSettingsUpdate {
@@ -923,6 +924,11 @@ export interface AdfsSettingsUpdate {
   scope: string;
   usernameClaim: string;
   autoProvision: boolean;
+  /**
+     * Optional PEM-encoded CA certificate bundle used to verify AD FS HTTPS. A non-empty value replaces the stored bundle; null or an empty value keeps the existing bundle.
+     * @nullable
+     */
+  caCertificate?: string | null;
 }
 
 export interface AdfsTestResult {
@@ -1033,3 +1039,4 @@ entityType?: string;
 from?: string;
 to?: string;
 };
+

@@ -1262,7 +1262,8 @@ export const GetAdfsSettingsResponse = zod.object({
   "redirectUri": zod.string(),
   "scope": zod.string(),
   "usernameClaim": zod.string(),
-  "autoProvision": zod.boolean()
+  "autoProvision": zod.boolean(),
+  "caCertificateSet": zod.boolean()
 })
 
 
@@ -1274,7 +1275,8 @@ export const UpdateAdfsSettingsBody = zod.object({
   "redirectUri": zod.string(),
   "scope": zod.string(),
   "usernameClaim": zod.string(),
-  "autoProvision": zod.boolean()
+  "autoProvision": zod.boolean(),
+  "caCertificate": zod.string().nullish().describe('Optional PEM-encoded CA certificate bundle used to verify AD FS HTTPS. A non-empty value replaces the stored bundle; null or an empty value keeps the existing bundle.')
 })
 
 export const UpdateAdfsSettingsResponse = zod.object({
@@ -1285,7 +1287,8 @@ export const UpdateAdfsSettingsResponse = zod.object({
   "redirectUri": zod.string(),
   "scope": zod.string(),
   "usernameClaim": zod.string(),
-  "autoProvision": zod.boolean()
+  "autoProvision": zod.boolean(),
+  "caCertificateSet": zod.boolean()
 })
 
 
