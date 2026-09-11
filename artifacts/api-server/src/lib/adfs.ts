@@ -173,12 +173,12 @@ async function validateIdToken(idToken: string, state: AdfsState, discovery: Dis
   const jwksResponse = await fetch(discovery.jwks_uri, { headers: { accept: "application/json" } });
   if (!jwksResponse.ok) throw new Error(`ADFS JWKS returned HTTP ${jwksResponse.status}`);
   const jwks = (await jwksResponse.json()) as {
-    keys?: Array<JsonWebKey & { kid?: string; alg?: string; use?: string }>;
+    keys?: Array<Record<string, unknown> & { kid?: string; alg?: string; use?: string }>;
   };
   const jwk = jwks.keys?.find((key) => key.kid === decoded.header.kid);
   if (!jwk) throw new Error("ADFS signing key was not found");
 
-  const publicKey = createPublicKey({ key: jwk, format: "jwk" });
+  const publicKey = createPublicKey({ key: jwk as any, format: "jwk" });
   const payload = jwt.verify(idToken, publicKey, {
     algorithms: ["RS256"],
     issuer: discovery.issuer || issuer(),
